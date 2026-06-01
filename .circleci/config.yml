@@ -1,16 +1,29 @@
 version: 2.1
 orbs:
   lucos: lucos/deploy@0
+
+jobs:
+  test:
+    docker:
+      - image: golang:1.26-alpine
+    steps:
+      - checkout
+      - run:
+          name: Run tests
+          command: go test ./...
+
 workflows:
   version: 2
   build-deploy:
     jobs:
+      - test
       - lucos/build:
           platform: "linux/amd64,linux/arm64"
           serial-group: << pipeline.project.slug >>/build/<< pipeline.git.branch >>
       - lucos/deploy-avalon:
           serial-group: deploy-avalon
           requires:
+            - test
             - lucos/build
           filters:
             branches:
@@ -19,6 +32,7 @@ workflows:
       - lucos/deploy-xwing:
           serial-group: deploy-xwing
           requires:
+            - test
             - lucos/build
           filters:
             branches:
@@ -27,6 +41,7 @@ workflows:
       - lucos/deploy-salvare:
           serial-group: deploy-salvare
           requires:
+            - test
             - lucos/build
           filters:
             branches:
