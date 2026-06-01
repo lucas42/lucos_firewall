@@ -1,0 +1,46 @@
+name: "CodeQL"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '56 19 * * *'
+  workflow_run:
+    # Re-run CodeQL after auto-merge workflows complete, because merges done
+    # with GITHUB_TOKEN (github-actions[bot]) don't trigger push-based workflows.
+    workflows: ["Dependabot auto-merge", "Auto-merge on code reviewer approval"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'python' ]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v6
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v4
+      with:
+        languages: ${{ matrix.language }}
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v4
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v4

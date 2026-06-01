@@ -1,0 +1,19 @@
+name: Auto-merge on code reviewer approval
+
+on:
+  pull_request_review:
+    types:
+      - submitted
+  pull_request:
+    types:
+      - closed
+
+permissions:
+  contents: read
+
+jobs:
+  reusable:
+    uses: lucas42/.github/.github/workflows/reusable-code-reviewer-auto-merge.yml@v1.19.0
+    secrets:
+      LUCOS_CI_APP_ID: ${{ secrets.LUCOS_CI_APP_ID }}
+      LUCOS_CI_PRIVATE_KEY: ${{ secrets.LUCOS_CI_PRIVATE_KEY }}

@@ -1,0 +1,15 @@
+services:
+  lucos_firewall:
+    build: .
+    container_name: lucos_firewall
+    image: lucas42/lucos_firewall:${VERSION:-latest}
+    restart: always
+    # Legitimate host-network use: the container manages the host's netfilter.
+    # See ADR-0007 for written justification.
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - SYSTEM
+      - ENVIRONMENT
+      - CONFIGY_ENDPOINT
