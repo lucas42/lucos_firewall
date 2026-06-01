@@ -42,28 +42,62 @@ type PublicPort struct {
 	Purpose  string `json:"purpose"`
 }
 
+// HostConfig holds the per-host configuration returned by configy /hosts/{host}.
+// Only the fields consumed by lucos_firewall are decoded here.
+type HostConfig struct {
+	FirewallEnforce bool `json:"firewall_enforce"`
+}
+
 // appConfig holds runtime configuration read once at startup.
 type appConfig struct {
-	hostname      string
-	configyOrigin string
-	dryRun        bool
-	pollInterval  time.Duration
+	hostname       string
+	configyOrigin  string
+	// dryRunOverride is true when DRY_RUN env var is set.
+	// When true it beats configy — the firewall always runs in dry-run mode
+	// regardless of configy's firewall_enforce value. Retained as a transition
+	// fallback while configy becomes the primary source of truth (ADR-0007).
+	dryRunOverride bool
+	pollInterval   time.Duration
 	confirmTimeout time.Duration
 }
 
 func main() {
 	cfg := readConfig()
 
-	if cfg.dryRun {
-		log.Println("Starting in DRY-RUN mode — rulesets will be logged but not applied")
+	if cfg.dryRunOverride {
+		log.Println("DRY_RUN override active — rulesets will always be logged but not applied (overrides configy firewall_enforce)")
 	} else {
-		log.Printf("Starting in ENFORCE mode — rulesets applied via iptables-restore / ip6tables-restore (auto-rollback after %s if configy unreachable)", cfg.confirmTimeout)
+		log.Printf("Enforce mode will be read per-poll from configy /hosts/%s (initial state: dry-run until first successful fetch)", cfg.hostname)
 	}
 	log.Printf("Host: %s, Configy: %s, Poll interval: %s", cfg.hostname, cfg.configyOrigin, cfg.pollInterval)
 
 	var lastIPv4Hash, lastIPv6Hash string
+	var lastKnownEnforce *bool // nil = no successful configy fetch yet (cold start)
 
 	for {
+		// Step 1: determine enforce mode from configy (per-host, per-poll).
+		fetchedEnforce, enforceErr := fetchEnforceMode(cfg)
+		var effectiveDryRun bool
+		effectiveDryRun, lastKnownEnforce = resolveEnforceMode(enforceErr, fetchedEnforce, lastKnownEnforce, cfg.dryRunOverride)
+		if enforceErr != nil {
+			if lastKnownEnforce == nil {
+				log.Printf("WARNING: Cold start — configy enforce-mode fetch failed (%v), defaulting to dry-run", enforceErr)
+			} else {
+				heldMode := "dry-run"
+				if *lastKnownEnforce {
+					heldMode = "enforce"
+				}
+				log.Printf("WARNING: Failed to fetch enforce mode from configy (%v) — holding last-known-good (%s)", enforceErr, heldMode)
+			}
+		} else {
+			effectiveMode := "dry-run"
+			if !effectiveDryRun {
+				effectiveMode = "enforce"
+			}
+			log.Printf("Enforce mode from configy: firewall_enforce=%v (effective: %s)", fetchedEnforce, effectiveMode)
+		}
+
+		// Step 2: fetch public ports from configy.
 		ports, err := fetchPublicPorts(cfg)
 		if err != nil {
 			log.Printf("WARNING: Failed to fetch public ports from configy: %v", err)
@@ -88,7 +122,7 @@ func main() {
 
 		if !rulesetChanged {
 			log.Println("Ruleset unchanged — skipping apply")
-		} else if cfg.dryRun {
+		} else if effectiveDryRun {
 			// Dry-run: log rulesets, don't touch iptables
 			log.Println("Ruleset changed (DRY-RUN mode)")
 			logRuleset(ipv4Ruleset, "iptables-restore")
@@ -147,7 +181,7 @@ func readConfig() appConfig {
 	// Strip trailing slash so we can safely append paths
 	configyOrigin = strings.TrimRight(configyOrigin, "/")
 
-	dryRun := os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1"
+	dryRunOverride := os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1"
 
 	pollInterval := time.Duration(defaultPollIntervalSeconds) * time.Second
 	if raw := os.Getenv("POLL_INTERVAL_SECONDS"); raw != "" {
@@ -170,7 +204,7 @@ func readConfig() appConfig {
 	return appConfig{
 		hostname:       hostname,
 		configyOrigin:  configyOrigin,
-		dryRun:         dryRun,
+		dryRunOverride: dryRunOverride,
 		pollInterval:   pollInterval,
 		confirmTimeout: confirmTimeout,
 	}
@@ -204,6 +238,79 @@ func fetchPublicPorts(cfg appConfig) ([]PublicPort, error) {
 		return nil, fmt.Errorf("parsing JSON response: %w", err)
 	}
 	return ports, nil
+}
+
+// fetchEnforceMode fetches the per-host firewall_enforce flag from configy /hosts/{host}.
+// Returns (enforce=true, nil) when enforce mode is active, (false, nil) for dry-run, or
+// (false, err) when the request fails (caller uses last-known-good or cold-start default).
+// A 404 response (host not yet in configy) is treated as firewall_enforce: false (dry-run),
+// consistent with configy's absent-field default.
+func fetchEnforceMode(cfg appConfig) (bool, error) {
+	url := fmt.Sprintf("%s/hosts/%s", cfg.configyOrigin, cfg.hostname)
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeoutSeconds*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("building request for %s: %w", url, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("HTTP request to %s failed: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Host not yet in configy — treat as firewall_enforce: false (dry-run default)
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("configy returned HTTP %d for %s", resp.StatusCode, url)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, fmt.Errorf("reading response body from %s: %w", url, err)
+	}
+
+	var hc HostConfig
+	if err := json.Unmarshal(body, &hc); err != nil {
+		return false, fmt.Errorf("parsing JSON response from %s: %w", url, err)
+	}
+	return hc.FirewallEnforce, nil
+}
+
+// resolveEnforceMode determines the effective dry-run/enforce mode and the updated
+// last-known-good state from the configy fetch result.
+//
+// It is a pure function with no side effects — all logging is the caller's responsibility.
+//
+//   fetchErr:       non-nil if the configy fetch failed this poll iteration
+//   fetchedEnforce: the firewall_enforce value returned by configy (valid only when fetchErr == nil)
+//   lastKnown:      pointer to the last successfully fetched enforce value (nil = cold start)
+//   dryRunOverride: true when the DRY_RUN env var forces dry-run regardless of configy
+//
+// Returns:
+//   effectiveDryRun:    true  → run in dry-run mode; false → run in enforce mode
+//   updatedLastKnown:   new last-known-good (set on successful fetch; unchanged on error)
+func resolveEnforceMode(fetchErr error, fetchedEnforce bool, lastKnown *bool, dryRunOverride bool) (effectiveDryRun bool, updatedLastKnown *bool) {
+	if fetchErr == nil {
+		// Successful fetch — update last-known-good
+		v := fetchedEnforce
+		updatedLastKnown = &v
+	} else {
+		// Failed fetch — hold last-known-good unchanged
+		updatedLastKnown = lastKnown
+	}
+
+	if dryRunOverride {
+		// DRY_RUN env var wins unconditionally
+		return true, updatedLastKnown
+	}
+	if updatedLastKnown == nil {
+		// Cold start with no successful fetch yet — default to dry-run (safe)
+		return true, nil
+	}
+	return !*updatedLastKnown, updatedLastKnown
 }
 
 // validateProtocol returns an error if proto is not a known safe iptables protocol keyword.
