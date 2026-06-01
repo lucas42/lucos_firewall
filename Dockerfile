@@ -1,15 +1,18 @@
-FROM python:3.14-alpine
+# Build stage: compile the Go binary
+FROM golang:1.24-alpine AS builder
+WORKDIR /build
+COPY go.mod .
+COPY main.go .
+RUN go build -ldflags="-s -w" -o firewall .
+
+# Runtime stage: minimal alpine with iptables/ip6tables available
+FROM alpine:3.21
 ARG VERSION
 ENV VERSION=$VERSION
 
-WORKDIR /usr/src/app
-
-# iptables is needed at container runtime to apply rules
+# iptables / ip6tables are needed at container runtime to apply rules
 RUN apk add --no-cache iptables ip6tables
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /build/firewall /usr/local/bin/firewall
 
-COPY main.py .
-
-CMD ["python3", "main.py"]
+CMD ["firewall"]
