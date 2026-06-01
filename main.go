@@ -29,6 +29,9 @@ const (
 	defaultPollIntervalSeconds   = 60
 	defaultConfirmTimeoutSeconds = 30
 	httpTimeoutSeconds           = 10
+	// heartbeatPath is touched on every successful poll loop iteration.
+	// The Docker healthcheck verifies this file is fresh (< 2 min old).
+	heartbeatPath = "/tmp/lucos-firewall-ok"
 )
 
 // PublicPort represents one entry from the configy /systems/host/{host}/public-ports endpoint.
@@ -107,6 +110,11 @@ func main() {
 				log.Println("Rules NOT confirmed — will retry on next poll")
 			}
 		}
+
+		// Touch the heartbeat file so the Docker healthcheck knows the loop
+		// is alive. Written on every iteration regardless of whether rules
+		// changed — the file's modification time is what the check reads.
+		touchHeartbeat()
 
 		time.Sleep(cfg.pollInterval)
 	}
@@ -314,6 +322,16 @@ func runRestore(command, ruleset string) error {
 // logRuleset logs what would be applied in dry-run mode.
 func logRuleset(ruleset, command string) {
 	log.Printf("[DRY-RUN] Would apply via %s:\n%s", command, ruleset)
+}
+
+// touchHeartbeat creates or updates the heartbeat file so the Docker
+// healthcheck can verify the poll loop is alive. The healthcheck reads the
+// file's modification time; a stale or missing file signals an unhealthy
+// container. Errors are logged but do not abort the poll loop.
+func touchHeartbeat() {
+	if err := os.WriteFile(heartbeatPath, nil, 0644); err != nil {
+		log.Printf("WARNING: Failed to update heartbeat file %s: %v", heartbeatPath, err)
+	}
 }
 
 // generateIPv4Ruleset builds the iptables (IPv4) rules for the given host.
