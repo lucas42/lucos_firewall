@@ -60,15 +60,15 @@ This means a bad ruleset that disrupts network connectivity self-heals within `C
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SYSTEM` | Yes* | — | Hostname used to query configy. Falls back to `HOSTNAME` if not set. |
-| `HOSTNAME` | Yes* | — | Fallback hostname if `SYSTEM` is not set. |
+| `FIREWALL_HOST` | **Yes** | — | The configy host identifier for this machine: `avalon`, `xwing`, or `salvare`. Must match a key in configy's `hosts:` list. Set in the host's `.env` via lucos_creds. |
 | `CONFIGY_ORIGIN` | No | `https://configy.l42.eu` | Base URL of the lucos_configy API. |
 | `DRY_RUN` | No | `false` | Set to `true` or `1` to log rulesets without applying them. Use for initial deployment. |
 | `POLL_INTERVAL_SECONDS` | No | `60` | How often to poll configy for changes. |
 | `CONFIRM_TIMEOUT_SECONDS` | No | `30` | Confirmation window for the auto-rollback guardrail (enforce mode only). |
+| `SYSTEM` | No | — | lucos service name (auto-provided). Not used for host identification. |
 | `ENVIRONMENT` | No | — | Passed through for logging / `/_info` purposes. |
 
-\* At least one of `SYSTEM` or `HOSTNAME` must be set — the container will exit if neither is present.
+**Why `FIREWALL_HOST` and not `SYSTEM` or `HOSTNAME`?** `SYSTEM` is the lucos service name (`lucos_firewall`), not a host — querying configy with it returns zero ports. `HOSTNAME` inside a container may reflect the container ID rather than the actual machine hostname, even with `network_mode: host`. An explicit, operator-set value is the only reliable source.
 
 ## Fallback behaviour when configy is unreachable
 

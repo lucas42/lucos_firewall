@@ -12,6 +12,7 @@ services:
     environment:
       - SYSTEM
       - ENVIRONMENT
+      - FIREWALL_HOST
       - CONFIGY_ORIGIN
       - DRY_RUN
       - CONFIRM_TIMEOUT_SECONDS

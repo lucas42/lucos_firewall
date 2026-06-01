@@ -113,12 +113,20 @@ func main() {
 }
 
 func readConfig() appConfig {
-	hostname := os.Getenv("SYSTEM")
+	// FIREWALL_HOST is the configy host identifier (e.g. "avalon", "xwing",
+	// "salvare") — it must match a key in configy's hosts list.
+	// IMPORTANT: do NOT use SYSTEM here. SYSTEM is the lucos service name
+	// ("lucos_firewall"), not the host. Querying configy with the service name
+	// would return zero ports and silently generate base-only rules in enforce mode.
+	// HOSTNAME is also excluded: inside a container it may reflect the container
+	// ID or compose service name rather than the actual host, even with
+	// network_mode: host. An explicit, operator-set value is the only reliable
+	// source for the host identifier.
+	hostname := os.Getenv("FIREWALL_HOST")
 	if hostname == "" {
-		hostname = os.Getenv("HOSTNAME")
-	}
-	if hostname == "" {
-		log.Fatal("Neither SYSTEM nor HOSTNAME environment variable is set")
+		log.Fatal("FIREWALL_HOST environment variable is not set. " +
+			"Set it to the configy host identifier for this machine " +
+			"(e.g. avalon, xwing, or salvare).")
 	}
 
 	configyOrigin := os.Getenv("CONFIGY_ORIGIN")
