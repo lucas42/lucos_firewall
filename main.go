@@ -69,6 +69,10 @@ func main() {
 			ports = nil
 		} else {
 			log.Printf("Fetched %d public port(s) from configy for host %s", len(ports), cfg.hostname)
+			// Validate and filter ports before passing to the ruleset generator.
+			// Any entry with an invalid protocol is rejected here to prevent
+			// injection of arbitrary iptables rules via crafted configy responses.
+			ports = filterValidPorts(ports)
 		}
 
 		ipv4Ruleset := generateIPv4Ruleset(ports)
@@ -181,6 +185,34 @@ func fetchPublicPorts(cfg appConfig) ([]PublicPort, error) {
 		return nil, fmt.Errorf("parsing JSON response: %w", err)
 	}
 	return ports, nil
+}
+
+// validateProtocol returns an error if proto is not a known safe iptables protocol keyword.
+// Only "tcp" and "udp" are accepted — anything else (including values containing whitespace
+// or newlines) is rejected to prevent injection into the generated ruleset.
+func validateProtocol(proto string) error {
+	switch proto {
+	case "tcp", "udp":
+		return nil
+	default:
+		return fmt.Errorf("invalid protocol %q: must be \"tcp\" or \"udp\"", proto)
+	}
+}
+
+// filterValidPorts returns only the port entries that pass validateProtocol.
+// Entries with invalid protocols are logged and dropped; they never reach the
+// ruleset generator. This prevents a compromised or tampered configy response
+// from injecting arbitrary iptables rules via the protocol field.
+func filterValidPorts(ports []PublicPort) []PublicPort {
+	valid := make([]PublicPort, 0, len(ports))
+	for _, p := range ports {
+		if err := validateProtocol(p.Protocol); err != nil {
+			log.Printf("WARNING: Dropping port entry (system=%q port=%d): %v", p.System, p.Port, err)
+			continue
+		}
+		valid = append(valid, p)
+	}
+	return valid
 }
 
 // applyWithRollback implements the iptables-apply safety pattern:
@@ -321,10 +353,11 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 	if len(ports) > 0 {
 		sb.WriteString("# Per-service public ports (from configy)\n")
 		for _, p := range ports {
-			sb.WriteString(fmt.Sprintf(
-				"-A INPUT -p %s --dport %d -j ACCEPT  # %s: %s\n",
-				p.Protocol, p.Port, p.System, p.Purpose,
-			))
+			// p.Protocol is pre-validated (tcp/udp only); p.Port is an int (%d).
+			// System/Purpose labels are NOT included in the iptables output —
+			// they come from an external source and could contain newlines that
+			// would inject arbitrary rules. Labels appear in application logs only.
+			sb.WriteString(fmt.Sprintf("-A INPUT -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 		sb.WriteString("\n")
 	} else {
@@ -341,10 +374,7 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 
 	if len(ports) > 0 {
 		for _, p := range ports {
-			sb.WriteString(fmt.Sprintf(
-				"-A DOCKER-USER -p %s --dport %d -j ACCEPT  # %s\n",
-				p.Protocol, p.Port, p.System,
-			))
+			sb.WriteString(fmt.Sprintf("-A DOCKER-USER -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 	}
 	sb.WriteString("-A DOCKER-USER -j DROP\n")
@@ -394,10 +424,9 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 	if len(ports) > 0 {
 		sb.WriteString("# Per-service public ports (from configy)\n")
 		for _, p := range ports {
-			sb.WriteString(fmt.Sprintf(
-				"-A INPUT -p %s --dport %d -j ACCEPT  # %s: %s\n",
-				p.Protocol, p.Port, p.System, p.Purpose,
-			))
+			// System/Purpose labels are omitted from iptables output — external
+			// strings that could contain newlines are kept out of the ruleset.
+			sb.WriteString(fmt.Sprintf("-A INPUT -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 		sb.WriteString("\n")
 	} else {
@@ -410,10 +439,7 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 
 	if len(ports) > 0 {
 		for _, p := range ports {
-			sb.WriteString(fmt.Sprintf(
-				"-A DOCKER-USER -p %s --dport %d -j ACCEPT  # %s\n",
-				p.Protocol, p.Port, p.System,
-			))
+			sb.WriteString(fmt.Sprintf("-A DOCKER-USER -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 	}
 	sb.WriteString("-A DOCKER-USER -j DROP\n")
