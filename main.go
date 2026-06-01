@@ -326,11 +326,13 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 	var sb strings.Builder
 
 	sb.WriteString("*filter\n")
-	// INPUT: default DROP — only explicitly declared traffic is accepted
+	// INPUT: default DROP — only explicitly declared traffic is accepted.
 	sb.WriteString(":INPUT DROP [0:0]\n")
-	// DOCKER-USER: flushed and populated with our rules.
-	// Docker's FORWARD chain jumps here for published-port traffic.
-	// FORWARD itself is intentionally left under Docker's management.
+	// FORWARD: declared so iptables-restore includes it in the atomic replace,
+	// ensuring our -j DOCKER-USER jump is present immediately after every apply.
+	// Policy ACCEPT — Docker depends on forwarding being open for container traffic.
+	sb.WriteString(":FORWARD ACCEPT [0:0]\n")
+	// DOCKER-USER: flushed and populated with our allow-list + final DROP.
 	sb.WriteString(":DOCKER-USER - [0:0]\n")
 	sb.WriteString("\n")
 
@@ -372,6 +374,20 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 		sb.WriteString("# No service ports (fallback mode — configy unreachable or no ports declared)\n\n")
 	}
 
+	// --- FORWARD chain ---
+	// Re-establish the DOCKER-USER jump as the first rule in FORWARD.
+	// iptables-restore (without --noflush) atomically flushes every declared
+	// chain — including FORWARD — before writing new rules. Without this rule,
+	// Docker's FORWARD → DOCKER-USER jump would be wiped on every apply,
+	// leaving DOCKER-USER unreachable and container ports unfiltered until
+	// Docker re-adds its own FORWARD rules. Declaring FORWARD here and adding
+	// the jump guarantees DOCKER-USER is always reachable immediately after
+	// an apply. Docker will re-add its own FORWARD rules (DOCKER-ISOLATION,
+	// etc.) alongside ours; FORWARD policy stays ACCEPT for Docker forwarding.
+	sb.WriteString("# FORWARD: re-establish DOCKER-USER jump after atomic replace\n")
+	sb.WriteString("-A FORWARD -j DOCKER-USER\n")
+	sb.WriteString("\n")
+
 	// --- DOCKER-USER chain ---
 	// Mirrors the INPUT allow-list for Docker-published container traffic.
 	// A final DROP blocks any published port not explicitly declared.
@@ -400,6 +416,7 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 
 	sb.WriteString("*filter\n")
 	sb.WriteString(":INPUT DROP [0:0]\n")
+	sb.WriteString(":FORWARD ACCEPT [0:0]\n")
 	sb.WriteString(":DOCKER-USER - [0:0]\n")
 	sb.WriteString("\n")
 
@@ -440,6 +457,11 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 	} else {
 		sb.WriteString("# No service ports (fallback mode — configy unreachable or no ports declared)\n\n")
 	}
+
+	// --- FORWARD chain --- (same rationale as IPv4; see generateIPv4Ruleset)
+	sb.WriteString("# FORWARD: re-establish DOCKER-USER jump after atomic replace\n")
+	sb.WriteString("-A FORWARD -j DOCKER-USER\n")
+	sb.WriteString("\n")
 
 	// --- DOCKER-USER chain ---
 	sb.WriteString("# DOCKER-USER: mirror allow-list for Docker-published port traffic\n")
