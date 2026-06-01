@@ -31,6 +31,31 @@ Base rules (always present, regardless of configy data):
 
 Per-service entries: one ACCEPT rule per `public_ports` entry returned by configy for the current host, added to both `INPUT` and `DOCKER-USER`.
 
+## Safety guardrails
+
+Two mandatory guardrails protect against a bad ruleset locking administrators out of a remote host:
+
+### Guardrail 1 — SSH always allowed
+
+Host SSH (port 22) is unconditionally accepted in every generated ruleset, independent of the `public_ports` data from configy. The rule is present in:
+- The full ruleset (when configy is reachable)
+- The fallback ruleset (when configy is unreachable)
+- Dry-run log output, where it can be verified before any host is flipped to enforce mode
+
+A host with a broken configy-derived ruleset still has SSH accessible.
+
+### Guardrail 2 — Timed auto-rollback on enforce (`iptables-apply` pattern)
+
+When applying a new ruleset in enforce mode, the service:
+1. Saves the current iptables/ip6tables state with `iptables-save` / `ip6tables-save`
+2. Applies the new ruleset
+3. Waits for the confirmation window (`CONFIRM_TIMEOUT_SECONDS`, default 30s)
+4. After the window, verifies connectivity by re-fetching from configy
+5. If configy is **reachable**: rules confirmed and kept
+6. If configy is **not reachable**: previous state is restored via `iptables-restore` and the rules are retried on the next poll
+
+This means a bad ruleset that disrupts network connectivity self-heals within `CONFIRM_TIMEOUT_SECONDS` + one configy round-trip, without manual intervention.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
@@ -40,6 +65,7 @@ Per-service entries: one ACCEPT rule per `public_ports` entry returned by config
 | `CONFIGY_ENDPOINT` | No | `https://configy.l42.eu` | Base URL of the lucos_configy API. |
 | `DRY_RUN` | No | `false` | Set to `true` or `1` to log rulesets without applying them. Use for initial deployment. |
 | `POLL_INTERVAL_SECONDS` | No | `60` | How often to poll configy for changes. |
+| `CONFIRM_TIMEOUT_SECONDS` | No | `30` | Confirmation window for the auto-rollback guardrail (enforce mode only). |
 | `ENVIRONMENT` | No | — | Passed through for logging / `/_info` purposes. |
 
 \* At least one of `SYSTEM` or `HOSTNAME` must be set — the container will exit if neither is present.

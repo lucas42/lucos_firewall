@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -23,8 +24,9 @@ import (
 )
 
 const (
-	defaultConfigyEndpoint    = "https://configy.l42.eu"
-	defaultPollIntervalSeconds = 60
+	defaultConfigyEndpoint       = "https://configy.l42.eu"
+	defaultPollIntervalSeconds   = 60
+	defaultConfirmTimeoutSeconds = 30
 )
 
 // PublicPort represents one entry from the configy /systems/host/{host}/public-ports endpoint.
@@ -37,10 +39,11 @@ type PublicPort struct {
 
 // appConfig holds runtime configuration read once at startup.
 type appConfig struct {
-	hostname        string
+	hostname       string
 	configyEndpoint string
-	dryRun          bool
-	pollInterval    time.Duration
+	dryRun         bool
+	pollInterval   time.Duration
+	confirmTimeout time.Duration
 }
 
 func main() {
@@ -49,7 +52,7 @@ func main() {
 	if cfg.dryRun {
 		log.Println("Starting in DRY-RUN mode — rulesets will be logged but not applied")
 	} else {
-		log.Println("Starting in ENFORCE mode — rulesets will be applied via iptables-restore / ip6tables-restore")
+		log.Printf("Starting in ENFORCE mode — rulesets applied via iptables-restore / ip6tables-restore (auto-rollback after %s if configy unreachable)", cfg.confirmTimeout)
 	}
 	log.Printf("Host: %s, Configy: %s, Poll interval: %s", cfg.hostname, cfg.configyEndpoint, cfg.pollInterval)
 
@@ -72,30 +75,31 @@ func main() {
 		ipv4Hash := hashString(ipv4Ruleset)
 		ipv6Hash := hashString(ipv6Ruleset)
 
-		if ipv4Hash != lastIPv4Hash {
-			log.Println("IPv4 ruleset changed — applying via iptables-restore")
-			if err := applyRuleset(ipv4Ruleset, "iptables-restore", cfg.dryRun); err != nil {
-				log.Printf("ERROR: iptables-restore failed: %v", err)
-				// Don't update hash — we'll retry next poll
-			} else {
-				lastIPv4Hash = ipv4Hash
-				log.Printf("IPv4 ruleset applied (sha256: %s)", ipv4Hash[:12])
-			}
-		} else {
-			log.Println("IPv4 ruleset unchanged — skipping apply")
-		}
+		rulesetChanged := ipv4Hash != lastIPv4Hash || ipv6Hash != lastIPv6Hash
 
-		if ipv6Hash != lastIPv6Hash {
-			log.Println("IPv6 ruleset changed — applying via ip6tables-restore")
-			if err := applyRuleset(ipv6Ruleset, "ip6tables-restore", cfg.dryRun); err != nil {
-				log.Printf("ERROR: ip6tables-restore failed: %v", err)
-				// Don't update hash — we'll retry next poll
-			} else {
-				lastIPv6Hash = ipv6Hash
-				log.Printf("IPv6 ruleset applied (sha256: %s)", ipv6Hash[:12])
-			}
+		if !rulesetChanged {
+			log.Println("Ruleset unchanged — skipping apply")
+		} else if cfg.dryRun {
+			// Dry-run: log rulesets, don't touch iptables
+			log.Println("Ruleset changed (DRY-RUN mode)")
+			logRuleset(ipv4Ruleset, "iptables-restore")
+			logRuleset(ipv6Ruleset, "ip6tables-restore")
+			lastIPv4Hash = ipv4Hash
+			lastIPv6Hash = ipv6Hash
 		} else {
-			log.Println("IPv6 ruleset unchanged — skipping apply")
+			// Enforce mode: save → apply → confirm → revert-if-needed
+			confirmed, applyErr := applyWithRollback(ipv4Ruleset, ipv6Ruleset, cfg)
+			if applyErr != nil {
+				log.Printf("ERROR applying ruleset: %v", applyErr)
+			}
+			if confirmed {
+				lastIPv4Hash = ipv4Hash
+				lastIPv6Hash = ipv6Hash
+				log.Println("Rules confirmed and active")
+			} else {
+				// Rolled back or apply failed — don't update hashes so we retry next poll
+				log.Println("Rules NOT confirmed — will retry on next poll")
+			}
 		}
 
 		time.Sleep(cfg.pollInterval)
@@ -129,11 +133,21 @@ func readConfig() appConfig {
 		}
 	}
 
+	confirmTimeout := time.Duration(defaultConfirmTimeoutSeconds) * time.Second
+	if raw := os.Getenv("CONFIRM_TIMEOUT_SECONDS"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			confirmTimeout = time.Duration(n) * time.Second
+		} else {
+			log.Printf("WARNING: Invalid CONFIRM_TIMEOUT_SECONDS=%q — using default %ds", raw, defaultConfirmTimeoutSeconds)
+		}
+	}
+
 	return appConfig{
 		hostname:        hostname,
 		configyEndpoint: configyEndpoint,
 		dryRun:          dryRun,
 		pollInterval:    pollInterval,
+		confirmTimeout:  confirmTimeout,
 	}
 }
 
@@ -161,8 +175,102 @@ func fetchPublicPorts(cfg appConfig) ([]PublicPort, error) {
 	return ports, nil
 }
 
+// applyWithRollback implements the iptables-apply safety pattern:
+//  1. Save the current iptables/ip6tables state.
+//  2. Apply the new rulesets.
+//  3. Wait for the confirmation window (cfg.confirmTimeout).
+//  4. Re-check configy to confirm the host still has network connectivity.
+//  5. If the check fails, revert to the saved state and return (false, err).
+//  6. If the check succeeds, return (true, nil).
+//
+// This ensures a bad ruleset self-heals without manual intervention. If a new
+// ruleset were to drop connectivity (e.g., a bug removing the ESTABLISHED/RELATED
+// rule), the configy check would fail and the previous known-good rules are restored.
+//
+// NOTE: SSH port 22 is unconditionally hardcoded in every generated ruleset
+// (guardrail 1). applyWithRollback is guardrail 2 — a belt-and-suspenders defence.
+func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirmed bool, err error) {
+	// Step 1: save current state
+	savedIPv4, err := saveRules("iptables-save")
+	if err != nil {
+		return false, fmt.Errorf("saving IPv4 rules before apply: %w", err)
+	}
+	savedIPv6, err := saveRules("ip6tables-save")
+	if err != nil {
+		return false, fmt.Errorf("saving IPv6 rules before apply: %w", err)
+	}
+
+	// Step 2: apply new IPv4 rules
+	log.Println("Applying IPv4 ruleset via iptables-restore")
+	if err := runRestore("iptables-restore", ipv4Ruleset); err != nil {
+		// Nothing to revert — IPv4 apply failed before any change was committed
+		return false, fmt.Errorf("iptables-restore failed: %w", err)
+	}
+
+	// Step 2b: apply new IPv6 rules — revert IPv4 if this fails
+	log.Println("Applying IPv6 ruleset via ip6tables-restore")
+	if err := runRestore("ip6tables-restore", ipv6Ruleset); err != nil {
+		log.Printf("ip6tables-restore failed (%v) — reverting IPv4 rules", err)
+		if revertErr := runRestore("iptables-restore", savedIPv4); revertErr != nil {
+			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
+		return false, fmt.Errorf("ip6tables-restore failed: %w", err)
+	}
+
+	// Step 3: confirmation window — wait before verifying
+	log.Printf("Rules applied — waiting %s for confirmation window", cfg.confirmTimeout)
+	time.Sleep(cfg.confirmTimeout)
+
+	// Step 4: verify configy is reachable (proves outbound connectivity is intact)
+	log.Println("Confirmation window elapsed — verifying configy reachability")
+	if _, verifyErr := fetchPublicPorts(cfg); verifyErr != nil {
+		log.Printf("WARNING: Confirmation failed — configy unreachable after %s: %v", cfg.confirmTimeout, verifyErr)
+		log.Println("Auto-reverting to previous ruleset (iptables-apply safety pattern)")
+
+		if revertErr := runRestore("iptables-restore", savedIPv4); revertErr != nil {
+			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
+		if revertErr := runRestore("ip6tables-restore", savedIPv6); revertErr != nil {
+			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
+		}
+		return false, fmt.Errorf("auto-reverted after %s: configy unreachable", cfg.confirmTimeout)
+	}
+
+	return true, nil
+}
+
+// saveRules runs iptables-save or ip6tables-save and returns the output.
+func saveRules(command string) (string, error) {
+	var out bytes.Buffer
+	cmd := exec.Command(command)
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%s failed: %w", command, err)
+	}
+	return out.String(), nil
+}
+
+// runRestore pipes the given ruleset into iptables-restore or ip6tables-restore.
+func runRestore(command, ruleset string) error {
+	cmd := exec.Command(command)
+	cmd.Stdin = strings.NewReader(ruleset)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// logRuleset logs what would be applied in dry-run mode.
+func logRuleset(ruleset, command string) {
+	log.Printf("[DRY-RUN] Would apply via %s:\n%s", command, ruleset)
+}
+
 // generateIPv4Ruleset builds the iptables (IPv4) rules for the given host.
 // If ports is nil, a fallback base ruleset is generated (no service ports).
+//
+// Safety guardrail 1: SSH port 22 is unconditionally accepted, independent of
+// the configy-derived public_ports list. It is visibly present in dry-run output
+// and can be verified before any host is flipped to enforce mode.
 //
 // Only INPUT and DOCKER-USER chains are managed. FORWARD is left under
 // Docker's control so container networking is not disrupted.
@@ -187,8 +295,11 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 	sb.WriteString("-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n")
 	sb.WriteString("\n")
 
-	// Port 22 is hardcoded — it's a host OS service, not a lucos service
-	sb.WriteString("# Host SSH (hardcoded — not a lucos service)\n")
+	// Safety guardrail 1: SSH is hardcoded, NOT derived from configy.
+	// This rule is unconditional and present in every generated ruleset,
+	// including the fallback. Dry-run output can be inspected to confirm
+	// this rule is present before any host is flipped to enforce mode.
+	sb.WriteString("# Host SSH — unconditional, independent of configy (safety guardrail)\n")
 	sb.WriteString("-A INPUT -p tcp --dport 22 -j ACCEPT\n")
 	sb.WriteString("\n")
 
@@ -215,8 +326,8 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 	// --- DOCKER-USER chain ---
 	// Mirrors the INPUT allow-list for Docker-published container traffic.
 	// A final DROP blocks any published port not explicitly declared.
-	// Connection tracking is included so that established connections to
-	// allowed ports are not disrupted mid-session during a ruleset re-apply.
+	// ESTABLISHED/RELATED is accepted first so in-flight sessions survive
+	// a ruleset re-apply.
 	sb.WriteString("# DOCKER-USER: mirror allow-list for Docker-published port traffic\n")
 	sb.WriteString("-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n")
 
@@ -255,7 +366,8 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 	sb.WriteString("-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n")
 	sb.WriteString("\n")
 
-	sb.WriteString("# Host SSH (hardcoded — not a lucos service)\n")
+	// Safety guardrail 1: SSH unconditional — see generateIPv4Ruleset for rationale
+	sb.WriteString("# Host SSH — unconditional, independent of configy (safety guardrail)\n")
 	sb.WriteString("-A INPUT -p tcp --dport 22 -j ACCEPT\n")
 	sb.WriteString("\n")
 
@@ -301,21 +413,6 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 
 	sb.WriteString("COMMIT\n")
 	return sb.String()
-}
-
-// applyRuleset pipes the given ruleset into the specified restore command
-// (iptables-restore or ip6tables-restore). In dry-run mode, the ruleset
-// is logged instead of applied.
-func applyRuleset(ruleset, command string, dryRun bool) error {
-	if dryRun {
-		log.Printf("[DRY-RUN] Would apply via %s:\n%s", command, ruleset)
-		return nil
-	}
-	cmd := exec.Command(command)
-	cmd.Stdin = strings.NewReader(ruleset)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
 // hashString returns the hex-encoded SHA-256 hash of s.
