@@ -9,11 +9,58 @@ Implements the host-level default-deny firewall described in [ADR-0007](https://
 `lucos_firewall` runs as a container on each internet-facing lucos host (`avalon`, `xwing`, `salvare`). It:
 
 1. Fetches the `public_ports` configuration from `lucos_configy` for the current host.
-2. Generates an `iptables` + `ip6tables` ruleset: default DROP on inbound, with explicit ACCEPT rules only for ports declared in `public_ports`, plus host SSH (22), ICMP, and ESTABLISHED/RELATED tracking.
+2. Generates an `iptables` + `ip6tables` ruleset: default DROP on inbound, with explicit ACCEPT rules only for ports declared in `public_ports`, plus host SSH (22), ICMP/ICMPv6, and ESTABLISHED/RELATED connection tracking.
 3. Applies the ruleset via `iptables-restore` / `ip6tables-restore`.
 4. Polls for configy changes and re-applies when the declared port list changes.
 
-The container requires `cap_add: NET_ADMIN` and runs with `network_mode: host` — the only legitimate use of host networking in the lucos estate (it needs the host's netfilter).
+The container requires `cap_add: NET_ADMIN` and runs with `network_mode: host` — the only legitimate use of host networking in the lucos estate (it needs the host's netfilter to apply rules). See ADR-0007 for the written justification.
+
+## Ruleset shape
+
+Only the `INPUT` and `DOCKER-USER` chains are managed. The `FORWARD` chain is intentionally left under Docker's control so that container-to-container and container-to-external networking is not disrupted.
+
+- **`INPUT`** — catches host-network traffic (services running with `network_mode: host`).
+- **`DOCKER-USER`** — catches Docker-forwarded (port-published) traffic. Docker's own `FORWARD` chain jumps here before any Docker-managed chains.
+
+Base rules (always present, regardless of configy data):
+- Loopback (`-i lo`) ACCEPT
+- ESTABLISHED/RELATED ACCEPT (connection tracking)
+- SSH port 22 ACCEPT (host access — hardcoded, not a lucos service)
+- Conservative ICMP (IPv4): echo-request, destination-unreachable, time-exceeded, parameter-problem
+- Conservative ICMPv6 (IPv6): same types plus Neighbour Discovery Protocol (NDP) entries required for IPv6 host operation
+
+Per-service entries: one ACCEPT rule per `public_ports` entry returned by configy for the current host, added to both `INPUT` and `DOCKER-USER`.
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SYSTEM` | Yes* | — | Hostname used to query configy. Falls back to `HOSTNAME` if not set. |
+| `HOSTNAME` | Yes* | — | Fallback hostname if `SYSTEM` is not set. |
+| `CONFIGY_ENDPOINT` | No | `https://configy.l42.eu` | Base URL of the lucos_configy API. |
+| `DRY_RUN` | No | `false` | Set to `true` or `1` to log rulesets without applying them. Use for initial deployment. |
+| `POLL_INTERVAL_SECONDS` | No | `60` | How often to poll configy for changes. |
+| `ENVIRONMENT` | No | — | Passed through for logging / `/_info` purposes. |
+
+\* At least one of `SYSTEM` or `HOSTNAME` must be set — the container will exit if neither is present.
+
+## Fallback behaviour when configy is unreachable
+
+If configy cannot be reached at startup (or on any subsequent poll), the container applies a **base ruleset with no service ports** — SSH, ICMP/ICMPv6, loopback, and connection tracking only.
+
+This is a "fails closed" stance on service ports (all are blocked if configy is unavailable) while preserving basic host accessibility (SSH on port 22 remains open so the host can be reached for diagnosis).
+
+The container continues polling on the configured interval and will apply the full ruleset as soon as configy becomes reachable again.
+
+## Deployment
+
+### Dry-run mode (first step)
+
+Set `DRY_RUN=true` in the host's `.env` file. In this mode the container logs what it _would_ apply but makes no iptables changes. Run for ~a week on `avalon` before flipping to enforce mode.
+
+### Enforce mode
+
+Remove or set `DRY_RUN=false`. The container will apply rules via `iptables-restore` / `ip6tables-restore` on startup and whenever configy changes.
 
 ## References
 

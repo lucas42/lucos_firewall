@@ -13,3 +13,4 @@ services:
       - SYSTEM
       - ENVIRONMENT
       - CONFIGY_ENDPOINT
+      - DRY_RUN
