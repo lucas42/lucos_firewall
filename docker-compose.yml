@@ -15,6 +15,7 @@ services:
       - HOSTDOMAIN
       - CONFIGY_ORIGIN
       - DRY_RUN
+      - POLL_INTERVAL_SECONDS
       - CONFIRM_TIMEOUT_SECONDS
     healthcheck:
       # The poll loop touches /tmp/lucos-firewall-ok on every iteration.
