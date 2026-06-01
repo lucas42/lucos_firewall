@@ -16,3 +16,13 @@ services:
       - CONFIGY_ORIGIN
       - DRY_RUN
       - CONFIRM_TIMEOUT_SECONDS
+    healthcheck:
+      # The poll loop touches /tmp/lucos-firewall-ok on every iteration.
+      # Unhealthy if the file is missing or older than 2 minutes
+      # (covers the default 60s poll + 30s confirm-timeout in enforce mode).
+      # find + grep are provided by busybox in the Alpine runtime image.
+      test: ["CMD-SHELL", "find /tmp/lucos-firewall-ok -mmin -2 | grep -q ."]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
