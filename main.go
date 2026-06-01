@@ -123,12 +123,14 @@ func main() {
 		if !rulesetChanged {
 			log.Println("Ruleset unchanged — skipping apply")
 		} else if effectiveDryRun {
-			// Dry-run: log rulesets, don't touch iptables
+			// Dry-run: log rulesets, don't touch iptables.
+			// Hashes are NOT updated here — nothing has been applied, so there is
+			// no "current" state to track. If mode later flips to enforce, the hash
+			// will still be empty/stale and rulesetChanged will be true, ensuring
+			// the first enforce-mode poll actually applies the rules.
 			log.Println("Ruleset changed (DRY-RUN mode)")
 			logRuleset(ipv4Ruleset, "iptables-restore")
 			logRuleset(ipv6Ruleset, "ip6tables-restore")
-			lastIPv4Hash = ipv4Hash
-			lastIPv6Hash = ipv6Hash
 		} else {
 			// Enforce mode: save → apply → confirm → revert-if-needed
 			confirmed, applyErr := applyWithRollback(ipv4Ruleset, ipv6Ruleset, cfg)
