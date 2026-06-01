@@ -62,7 +62,7 @@ This means a bad ruleset that disrupts network connectivity self-heals within `C
 |---|---|---|---|
 | `SYSTEM` | Yes* | — | Hostname used to query configy. Falls back to `HOSTNAME` if not set. |
 | `HOSTNAME` | Yes* | — | Fallback hostname if `SYSTEM` is not set. |
-| `CONFIGY_ENDPOINT` | No | `https://configy.l42.eu` | Base URL of the lucos_configy API. |
+| `CONFIGY_ORIGIN` | No | `https://configy.l42.eu` | Base URL of the lucos_configy API. |
 | `DRY_RUN` | No | `false` | Set to `true` or `1` to log rulesets without applying them. Use for initial deployment. |
 | `POLL_INTERVAL_SECONDS` | No | `60` | How often to poll configy for changes. |
 | `CONFIRM_TIMEOUT_SECONDS` | No | `30` | Confirmation window for the auto-rollback guardrail (enforce mode only). |

@@ -10,6 +10,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -24,9 +25,10 @@ import (
 )
 
 const (
-	defaultConfigyEndpoint       = "https://configy.l42.eu"
+	defaultConfigyOrigin         = "https://configy.l42.eu"
 	defaultPollIntervalSeconds   = 60
 	defaultConfirmTimeoutSeconds = 30
+	httpTimeoutSeconds           = 10
 )
 
 // PublicPort represents one entry from the configy /systems/host/{host}/public-ports endpoint.
@@ -39,10 +41,10 @@ type PublicPort struct {
 
 // appConfig holds runtime configuration read once at startup.
 type appConfig struct {
-	hostname       string
-	configyEndpoint string
-	dryRun         bool
-	pollInterval   time.Duration
+	hostname      string
+	configyOrigin string
+	dryRun        bool
+	pollInterval  time.Duration
 	confirmTimeout time.Duration
 }
 
@@ -54,7 +56,7 @@ func main() {
 	} else {
 		log.Printf("Starting in ENFORCE mode — rulesets applied via iptables-restore / ip6tables-restore (auto-rollback after %s if configy unreachable)", cfg.confirmTimeout)
 	}
-	log.Printf("Host: %s, Configy: %s, Poll interval: %s", cfg.hostname, cfg.configyEndpoint, cfg.pollInterval)
+	log.Printf("Host: %s, Configy: %s, Poll interval: %s", cfg.hostname, cfg.configyOrigin, cfg.pollInterval)
 
 	var lastIPv4Hash, lastIPv6Hash string
 
@@ -115,12 +117,12 @@ func readConfig() appConfig {
 		log.Fatal("Neither SYSTEM nor HOSTNAME environment variable is set")
 	}
 
-	configyEndpoint := os.Getenv("CONFIGY_ENDPOINT")
-	if configyEndpoint == "" {
-		configyEndpoint = defaultConfigyEndpoint
+	configyOrigin := os.Getenv("CONFIGY_ORIGIN")
+	if configyOrigin == "" {
+		configyOrigin = defaultConfigyOrigin
 	}
 	// Strip trailing slash so we can safely append paths
-	configyEndpoint = strings.TrimRight(configyEndpoint, "/")
+	configyOrigin = strings.TrimRight(configyOrigin, "/")
 
 	dryRun := os.Getenv("DRY_RUN") == "true" || os.Getenv("DRY_RUN") == "1"
 
@@ -143,17 +145,23 @@ func readConfig() appConfig {
 	}
 
 	return appConfig{
-		hostname:        hostname,
-		configyEndpoint: configyEndpoint,
-		dryRun:          dryRun,
-		pollInterval:    pollInterval,
-		confirmTimeout:  confirmTimeout,
+		hostname:       hostname,
+		configyOrigin:  configyOrigin,
+		dryRun:         dryRun,
+		pollInterval:   pollInterval,
+		confirmTimeout: confirmTimeout,
 	}
 }
 
 func fetchPublicPorts(cfg appConfig) ([]PublicPort, error) {
-	url := fmt.Sprintf("%s/systems/host/%s/public-ports", cfg.configyEndpoint, cfg.hostname)
-	resp, err := http.Get(url) //nolint:noctx
+	url := fmt.Sprintf("%s/systems/host/%s/public-ports", cfg.configyOrigin, cfg.hostname)
+	ctx, cancel := context.WithTimeout(context.Background(), httpTimeoutSeconds*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building request for %s: %w", url, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("HTTP request to %s failed: %w", url, err)
 	}

@@ -12,6 +12,6 @@ services:
     environment:
       - SYSTEM
       - ENVIRONMENT
-      - CONFIGY_ENDPOINT
+      - CONFIGY_ORIGIN
       - DRY_RUN
       - CONFIRM_TIMEOUT_SECONDS
