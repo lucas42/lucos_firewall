@@ -1,12 +1,12 @@
 # Build stage: compile the Go binary
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 WORKDIR /build
 COPY go.mod .
 COPY main.go .
 RUN go build -ldflags="-s -w" -o firewall .
 
 # Runtime stage: minimal alpine with iptables/ip6tables available
-FROM alpine:3.21
+FROM alpine:3.23
 ARG VERSION
 ENV VERSION=$VERSION
 
