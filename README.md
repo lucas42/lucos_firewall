@@ -60,7 +60,7 @@ This means a bad ruleset that disrupts network connectivity self-heals within `C
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FIREWALL_HOST` | **Yes** | — | The configy host identifier for this machine: `avalon`, `xwing`, or `salvare`. Must match a key in configy's `hosts:` list. Set in the host's `.env` via lucos_creds. |
+| `HOSTDOMAIN` | **Yes** | — | SSH hostname of this host (e.g. `avalon.s.l42.eu`). Set automatically by the deploy orb per-host. In development, set to the host whose `public_ports` you want to test against. The configy host identifier is derived from this: first DNS label, `-vN` suffix stripped (`xwing-v4.s.l42.eu` → `xwing`). |
 | `CONFIGY_ORIGIN` | No | `https://configy.l42.eu` | Base URL of the lucos_configy API. |
 | `DRY_RUN` | No | `false` | Set to `true` or `1` to log rulesets without applying them. Use for initial deployment. |
 | `POLL_INTERVAL_SECONDS` | No | `60` | How often to poll configy for changes. |
@@ -68,7 +68,7 @@ This means a bad ruleset that disrupts network connectivity self-heals within `C
 | `SYSTEM` | No | — | lucos service name (auto-provided). Not used for host identification. |
 | `ENVIRONMENT` | No | — | Passed through for logging / `/_info` purposes. |
 
-**Why `FIREWALL_HOST` and not `SYSTEM` or `HOSTNAME`?** `SYSTEM` is the lucos service name (`lucos_firewall`), not a host — querying configy with it returns zero ports. `HOSTNAME` inside a container may reflect the container ID rather than the actual machine hostname, even with `network_mode: host`. An explicit, operator-set value is the only reliable source.
+**Why `HOSTDOMAIN` and not `SYSTEM` or `HOSTNAME`?** `SYSTEM` is the lucos service name (`lucos_firewall`), not a host — querying configy with it returns zero ports. `HOSTNAME` inside a container may reflect the container ID rather than the actual machine hostname. `HOSTDOMAIN` is the established lucos pattern: injected by the deploy orb at deploy time, it carries the correct per-host identity without a lucos_creds entry.
 
 ## Fallback behaviour when configy is unreachable
 

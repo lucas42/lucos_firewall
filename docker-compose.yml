@@ -12,7 +12,7 @@ services:
     environment:
       - SYSTEM
       - ENVIRONMENT
-      - FIREWALL_HOST
+      - HOSTDOMAIN
       - CONFIGY_ORIGIN
       - DRY_RUN
       - CONFIRM_TIMEOUT_SECONDS

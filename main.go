@@ -113,20 +113,23 @@ func main() {
 }
 
 func readConfig() appConfig {
-	// FIREWALL_HOST is the configy host identifier (e.g. "avalon", "xwing",
-	// "salvare") — it must match a key in configy's hosts list.
-	// IMPORTANT: do NOT use SYSTEM here. SYSTEM is the lucos service name
-	// ("lucos_firewall"), not the host. Querying configy with the service name
-	// would return zero ports and silently generate base-only rules in enforce mode.
-	// HOSTNAME is also excluded: inside a container it may reflect the container
-	// ID or compose service name rather than the actual host, even with
-	// network_mode: host. An explicit, operator-set value is the only reliable
-	// source for the host identifier.
-	hostname := os.Getenv("FIREWALL_HOST")
-	if hostname == "" {
-		log.Fatal("FIREWALL_HOST environment variable is not set. " +
-			"Set it to the configy host identifier for this machine " +
-			"(e.g. avalon, xwing, or salvare).")
+	// HOSTDOMAIN is injected by the deploy orb per-host
+	// (e.g. "avalon.s.l42.eu", "xwing-v4.s.l42.eu", "salvare-v4.s.l42.eu").
+	// Derive the configy host identifier by taking the first DNS label and
+	// stripping any trailing -vN version suffix — matching the same strip
+	// used by lucos_router's update-domains.sh.
+	// Examples: "avalon.s.l42.eu" → "avalon"
+	//           "xwing-v4.s.l42.eu" → "xwing"
+	//           "salvare-v4.s.l42.eu" → "salvare"
+	hostdomain := os.Getenv("HOSTDOMAIN")
+	if hostdomain == "" {
+		log.Fatal("HOSTDOMAIN environment variable is not set. " +
+			"It is injected automatically by the deploy orb per-host. " +
+			"In development, set it to e.g. \"avalon.s.l42.eu\".")
+	}
+	hostname := strings.SplitN(hostdomain, ".", 2)[0]
+	if idx := strings.Index(hostname, "-v"); idx >= 0 && idx+2 < len(hostname) && hostname[idx+2] >= '0' && hostname[idx+2] <= '9' {
+		hostname = hostname[:idx]
 	}
 
 	configyOrigin := os.Getenv("CONFIGY_ORIGIN")
