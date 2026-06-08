@@ -368,18 +368,33 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirme
 		return false, fmt.Errorf("saving IPv6 rules before apply: %w", err)
 	}
 
-	// Step 2: apply new IPv4 rules
-	log.Println("Applying IPv4 ruleset via iptables-restore")
-	if err := runRestore("iptables-restore", ipv4Ruleset); err != nil {
+	// Step 2: flush owned chains, then apply new IPv4 rules via --noflush restore.
+	// Docker-managed chains (FORWARD, DOCKER-FORWARD, DOCKER-ISOLATION-*) are
+	// untouched; prepareChains also ensures the FORWARD → DOCKER-USER jump exists.
+	log.Println("Preparing owned chains (IPv4)")
+	if err := prepareChains("iptables"); err != nil {
+		return false, fmt.Errorf("prepareChains (iptables): %w", err)
+	}
+	log.Println("Applying IPv4 ruleset via iptables-restore --noflush")
+	if err := runRestore("iptables-restore", ipv4Ruleset, true); err != nil {
 		// Nothing to revert — IPv4 apply failed before any change was committed
 		return false, fmt.Errorf("iptables-restore failed: %w", err)
 	}
 
-	// Step 2b: apply new IPv6 rules — revert IPv4 if this fails
-	log.Println("Applying IPv6 ruleset via ip6tables-restore")
-	if err := runRestore("ip6tables-restore", ipv6Ruleset); err != nil {
+	// Step 2b: apply new IPv6 rules — revert IPv4 if this fails.
+	// Full restore (noflush=false) for the revert so Docker's chains are also restored.
+	log.Println("Preparing owned chains (IPv6)")
+	if err := prepareChains("ip6tables"); err != nil {
+		log.Printf("prepareChains (ip6tables) failed (%v) — reverting IPv4 rules", err)
+		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
+			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
+		return false, fmt.Errorf("prepareChains (ip6tables): %w", err)
+	}
+	log.Println("Applying IPv6 ruleset via ip6tables-restore --noflush")
+	if err := runRestore("ip6tables-restore", ipv6Ruleset, true); err != nil {
 		log.Printf("ip6tables-restore failed (%v) — reverting IPv4 rules", err)
-		if revertErr := runRestore("iptables-restore", savedIPv4); revertErr != nil {
+		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
 			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
 		}
 		return false, fmt.Errorf("ip6tables-restore failed: %w", err)
@@ -395,10 +410,10 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirme
 		log.Printf("WARNING: Confirmation failed — configy unreachable after %s: %v", cfg.confirmTimeout, verifyErr)
 		log.Println("Auto-reverting to previous ruleset (iptables-apply safety pattern)")
 
-		if revertErr := runRestore("iptables-restore", savedIPv4); revertErr != nil {
+		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
 			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
 		}
-		if revertErr := runRestore("ip6tables-restore", savedIPv6); revertErr != nil {
+		if revertErr := runRestore("ip6tables-restore", savedIPv6, false); revertErr != nil {
 			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
 		}
 		return false, fmt.Errorf("auto-reverted after %s: configy unreachable", cfg.confirmTimeout)
@@ -420,12 +435,55 @@ func saveRules(command string) (string, error) {
 }
 
 // runRestore pipes the given ruleset into iptables-restore or ip6tables-restore.
-func runRestore(command, ruleset string) error {
-	cmd := exec.Command(command)
+// When noflush is true the --noflush flag is passed so only the chains declared
+// in the ruleset are touched; Docker-managed chains (FORWARD, DOCKER-FORWARD,
+// DOCKER-ISOLATION-*) are left intact. When noflush is false (rollback path)
+// the full table is replaced, restoring Docker's chains from the saved snapshot.
+func runRestore(command, ruleset string, noflush bool) error {
+	args := []string{}
+	if noflush {
+		args = []string{"--noflush"}
+	}
+	cmd := exec.Command(command, args...)
 	cmd.Stdin = strings.NewReader(ruleset)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// prepareChains flushes the two chains owned by lucos_firewall (INPUT and
+// DOCKER-USER) before a --noflush restore, and ensures the FORWARD →
+// DOCKER-USER jump exists. The iptablesCmd argument is "iptables" or
+// "ip6tables".
+//
+// Only INPUT and DOCKER-USER are touched. FORWARD is left under Docker's
+// control except for the idempotent jump guard, which ensures DOCKER-USER
+// is reachable on cold starts before Docker has initialised its own chains.
+func prepareChains(iptablesCmd string) error {
+	// Ensure DOCKER-USER exists — on cold start Docker may not have created
+	// it yet. Ignore errors (chain already exists).
+	exec.Command(iptablesCmd, "-N", "DOCKER-USER").Run()
+
+	// Flush our two owned chains so the --noflush restore appends a clean set.
+	if err := exec.Command(iptablesCmd, "-F", "DOCKER-USER").Run(); err != nil {
+		return fmt.Errorf("%s -F DOCKER-USER: %w", iptablesCmd, err)
+	}
+	// Brief gap: INPUT is empty under DROP policy until the restore completes.
+	// This is sub-millisecond; established sessions survive via TCP retransmit.
+	if err := exec.Command(iptablesCmd, "-F", "INPUT").Run(); err != nil {
+		return fmt.Errorf("%s -F INPUT: %w", iptablesCmd, err)
+	}
+
+	// Idempotent guard: ensure FORWARD → DOCKER-USER jump is present.
+	// -C returns exit code 1 if the rule is absent — not an error here.
+	// -I 1 inserts at position 1 so DOCKER-USER is first in FORWARD.
+	check := exec.Command(iptablesCmd, "-C", "FORWARD", "-j", "DOCKER-USER")
+	if err := check.Run(); err != nil {
+		if insertErr := exec.Command(iptablesCmd, "-I", "FORWARD", "1", "-j", "DOCKER-USER").Run(); insertErr != nil {
+			return fmt.Errorf("%s -I FORWARD 1 -j DOCKER-USER: %w", iptablesCmd, insertErr)
+		}
+	}
+	return nil
 }
 
 // logRuleset logs what would be applied in dry-run mode.
@@ -450,19 +508,19 @@ func touchHeartbeat() {
 // the configy-derived public_ports list. It is visibly present in dry-run output
 // and can be verified before any host is flipped to enforce mode.
 //
-// Only INPUT and DOCKER-USER chains are managed. FORWARD is left under
-// Docker's control so container networking is not disrupted.
+// Only INPUT and DOCKER-USER chains are managed. FORWARD is left entirely
+// under Docker's control — prepareChains adds the idempotent FORWARD →
+// DOCKER-USER jump before each --noflush restore without touching other
+// FORWARD rules that Docker manages (DOCKER-FORWARD, DOCKER-ISOLATION-*).
 func generateIPv4Ruleset(ports []PublicPort) string {
 	var sb strings.Builder
 
 	sb.WriteString("*filter\n")
 	// INPUT: default DROP — only explicitly declared traffic is accepted.
 	sb.WriteString(":INPUT DROP [0:0]\n")
-	// FORWARD: declared so iptables-restore includes it in the atomic replace,
-	// ensuring our -j DOCKER-USER jump is present immediately after every apply.
-	// Policy ACCEPT — Docker depends on forwarding being open for container traffic.
-	sb.WriteString(":FORWARD ACCEPT [0:0]\n")
 	// DOCKER-USER: flushed and populated with our allow-list + final DROP.
+	// FORWARD is NOT declared here — Docker owns it and manages DOCKER-FORWARD
+	// and DOCKER-ISOLATION chains; a whole-table replace would delete them.
 	sb.WriteString(":DOCKER-USER - [0:0]\n")
 	sb.WriteString("\n")
 
@@ -520,20 +578,6 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 		sb.WriteString("# No service ports declared for this host\n\n")
 	}
 
-	// --- FORWARD chain ---
-	// Re-establish the DOCKER-USER jump as the first rule in FORWARD.
-	// iptables-restore (without --noflush) atomically flushes every declared
-	// chain — including FORWARD — before writing new rules. Without this rule,
-	// Docker's FORWARD → DOCKER-USER jump would be wiped on every apply,
-	// leaving DOCKER-USER unreachable and container ports unfiltered until
-	// Docker re-adds its own FORWARD rules. Declaring FORWARD here and adding
-	// the jump guarantees DOCKER-USER is always reachable immediately after
-	// an apply. Docker will re-add its own FORWARD rules (DOCKER-ISOLATION,
-	// etc.) alongside ours; FORWARD policy stays ACCEPT for Docker forwarding.
-	sb.WriteString("# FORWARD: re-establish DOCKER-USER jump after atomic replace\n")
-	sb.WriteString("-A FORWARD -j DOCKER-USER\n")
-	sb.WriteString("\n")
-
 	// --- DOCKER-USER chain ---
 	// Polices externally-originating traffic to Docker-published ports.
 	// Traffic ingressing from Docker bridge interfaces (-i br+ or -i docker0)
@@ -566,7 +610,7 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 
 	sb.WriteString("*filter\n")
 	sb.WriteString(":INPUT DROP [0:0]\n")
-	sb.WriteString(":FORWARD ACCEPT [0:0]\n")
+	// FORWARD is NOT declared here — see generateIPv4Ruleset for rationale.
 	sb.WriteString(":DOCKER-USER - [0:0]\n")
 	sb.WriteString("\n")
 
@@ -618,11 +662,6 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 		// Non-nil empty slice: configy reachable, zero public ports declared.
 		sb.WriteString("# No service ports declared for this host\n\n")
 	}
-
-	// --- FORWARD chain --- (same rationale as IPv4; see generateIPv4Ruleset)
-	sb.WriteString("# FORWARD: re-establish DOCKER-USER jump after atomic replace\n")
-	sb.WriteString("-A FORWARD -j DOCKER-USER\n")
-	sb.WriteString("\n")
 
 	// --- DOCKER-USER chain ---
 	// Polices externally-originating traffic to Docker-published ports.
