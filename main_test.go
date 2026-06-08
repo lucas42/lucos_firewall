@@ -316,6 +316,51 @@ func TestGenerateIPv6Ruleset_HealthyZeroPortsComment_EmptySlice(t *testing.T) {
 	}
 }
 
+// ── FORWARD-chain absent tests ────────────────────────────────────────────────
+//
+// Since we switched to --noflush, FORWARD must NOT be declared in the generated
+// ruleset. Docker owns FORWARD; whole-table restore would delete Docker's chains
+// (DOCKER-FORWARD, DOCKER-ISOLATION-*) causing docker network create to fail.
+// The FORWARD → DOCKER-USER jump is now managed by prepareChains at apply time.
+
+func TestGenerateIPv4Ruleset_NoFORWARDChain(t *testing.T) {
+	for _, label := range []string{"nil ports", "empty ports", "with ports"} {
+		var ports []PublicPort
+		switch label {
+		case "empty ports":
+			ports = []PublicPort{}
+		case "with ports":
+			ports = []PublicPort{{Protocol: "tcp", Port: 443}}
+		}
+		ruleset := generateIPv4Ruleset(ports)
+		if strings.Contains(ruleset, ":FORWARD") {
+			t.Errorf("IPv4 (%s): generated ruleset must not declare :FORWARD chain", label)
+		}
+		if strings.Contains(ruleset, "-A FORWARD") {
+			t.Errorf("IPv4 (%s): generated ruleset must not append rules to FORWARD chain", label)
+		}
+	}
+}
+
+func TestGenerateIPv6Ruleset_NoFORWARDChain(t *testing.T) {
+	for _, label := range []string{"nil ports", "empty ports", "with ports"} {
+		var ports []PublicPort
+		switch label {
+		case "empty ports":
+			ports = []PublicPort{}
+		case "with ports":
+			ports = []PublicPort{{Protocol: "tcp", Port: 443}}
+		}
+		ruleset := generateIPv6Ruleset(ports)
+		if strings.Contains(ruleset, ":FORWARD") {
+			t.Errorf("IPv6 (%s): generated ruleset must not declare :FORWARD chain", label)
+		}
+		if strings.Contains(ruleset, "-A FORWARD") {
+			t.Errorf("IPv6 (%s): generated ruleset must not append rules to FORWARD chain", label)
+		}
+	}
+}
+
 func TestGenerateIPv4Ruleset_BridgeReturnBeforeDrop_NoPorts(t *testing.T) {
 	assertBridgeReturnBeforeDrop(t, generateIPv4Ruleset(nil), "IPv4 (no ports)")
 }
