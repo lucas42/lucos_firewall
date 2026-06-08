@@ -242,6 +242,34 @@ func assertBridgeReturnBeforeDrop(t *testing.T, ruleset, label string) {
 	}
 }
 
+// assertMDNSPresent verifies that the mDNS allow rule for the given destination
+// multicast address is present in the ruleset's INPUT chain.
+func assertMDNSPresent(t *testing.T, ruleset, dest, label string) {
+	t.Helper()
+	rule := fmt.Sprintf("-A INPUT -d %s -p udp --dport 5353 -j ACCEPT", dest)
+	if !strings.Contains(ruleset, rule) {
+		t.Errorf("%s: expected mDNS rule %q in INPUT chain", label, rule)
+	}
+}
+
+func TestGenerateIPv4Ruleset_MDNSPresent_NoPorts(t *testing.T) {
+	assertMDNSPresent(t, generateIPv4Ruleset(nil), "224.0.0.251", "IPv4 (no ports)")
+}
+
+func TestGenerateIPv4Ruleset_MDNSPresent_WithPorts(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 443}}
+	assertMDNSPresent(t, generateIPv4Ruleset(ports), "224.0.0.251", "IPv4 (with ports)")
+}
+
+func TestGenerateIPv6Ruleset_MDNSPresent_NoPorts(t *testing.T) {
+	assertMDNSPresent(t, generateIPv6Ruleset(nil), "ff02::fb", "IPv6 (no ports)")
+}
+
+func TestGenerateIPv6Ruleset_MDNSPresent_WithPorts(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 443}}
+	assertMDNSPresent(t, generateIPv6Ruleset(ports), "ff02::fb", "IPv6 (with ports)")
+}
+
 func TestGenerateIPv4Ruleset_BridgeReturnBeforeDrop_NoPorts(t *testing.T) {
 	assertBridgeReturnBeforeDrop(t, generateIPv4Ruleset(nil), "IPv4 (no ports)")
 }
