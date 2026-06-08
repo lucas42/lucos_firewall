@@ -490,6 +490,15 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 	sb.WriteString("-A INPUT -p icmp --icmp-type parameter-problem -j ACCEPT\n")
 	sb.WriteString("\n")
 
+	// mDNS: destination-scoped to the IPv4 link-local multicast group 224.0.0.251.
+	// This group is within 224.0.0.0/24 (Local Network Control Block, RFC 5771) —
+	// never forwarded by routers, so this opens nothing internet-reachable.
+	// mDNS is link-local infrastructure (RFC 6762) and belongs in the base allow-list
+	// alongside ICMP, not in configy public_ports (ADR-0007 Amendment 3).
+	sb.WriteString("# mDNS — link-local multicast only (never internet-routable, RFC 6762)\n")
+	sb.WriteString("-A INPUT -d 224.0.0.251 -p udp --dport 5353 -j ACCEPT\n")
+	sb.WriteString("\n")
+
 	if len(ports) > 0 {
 		sb.WriteString("# Per-service public ports (from configy)\n")
 		for _, p := range ports {
@@ -578,6 +587,13 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 	sb.WriteString("-A INPUT -p icmpv6 --icmpv6-type neighbour-advertisement -j ACCEPT\n")
 	sb.WriteString("-A INPUT -p icmpv6 --icmpv6-type router-solicitation -j ACCEPT\n")
 	sb.WriteString("-A INPUT -p icmpv6 --icmpv6-type router-advertisement -j ACCEPT\n")
+	sb.WriteString("\n")
+
+	// mDNS: destination-scoped to the IPv6 link-local multicast group ff02::fb.
+	// ff02::/16 is link-local scope (RFC 4291) — never forwarded by routers,
+	// so this opens nothing internet-reachable. Same class as the IPv4 rule above.
+	sb.WriteString("# mDNS — link-local multicast only (never internet-routable, RFC 6762)\n")
+	sb.WriteString("-A INPUT -d ff02::fb -p udp --dport 5353 -j ACCEPT\n")
 	sb.WriteString("\n")
 
 	if len(ports) > 0 {
