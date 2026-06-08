@@ -509,8 +509,15 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 			sb.WriteString(fmt.Sprintf("-A INPUT -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 		sb.WriteString("\n")
+	} else if ports == nil {
+		// nil means the configy fetch failed; the caller logged a warning and
+		// substituted nil to generate a base-only fallback ruleset.
+		sb.WriteString("# No service ports (fallback — configy unreachable; base rules only)\n\n")
 	} else {
-		sb.WriteString("# No service ports (fallback mode — configy unreachable or no ports declared)\n\n")
+		// Non-nil empty slice: configy was reachable but declared zero public ports
+		// for this host. This is the correct steady state for hosts with no
+		// internet-facing services (e.g. salvare).
+		sb.WriteString("# No service ports declared for this host\n\n")
 	}
 
 	// --- FORWARD chain ---
@@ -604,8 +611,12 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 			sb.WriteString(fmt.Sprintf("-A INPUT -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 		sb.WriteString("\n")
+	} else if ports == nil {
+		// nil means the configy fetch failed; see generateIPv4Ruleset for rationale.
+		sb.WriteString("# No service ports (fallback — configy unreachable; base rules only)\n\n")
 	} else {
-		sb.WriteString("# No service ports (fallback mode — configy unreachable or no ports declared)\n\n")
+		// Non-nil empty slice: configy reachable, zero public ports declared.
+		sb.WriteString("# No service ports declared for this host\n\n")
 	}
 
 	// --- FORWARD chain --- (same rationale as IPv4; see generateIPv4Ruleset)

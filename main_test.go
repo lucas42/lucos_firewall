@@ -270,6 +270,52 @@ func TestGenerateIPv6Ruleset_MDNSPresent_WithPorts(t *testing.T) {
 	assertMDNSPresent(t, generateIPv6Ruleset(ports), "ff02::fb", "IPv6 (with ports)")
 }
 
+// ── empty-ports comment tests ─────────────────────────────────────────────────
+//
+// The generator receives nil (configy unreachable → fallback) or a non-nil
+// empty slice (configy reachable, zero ports declared → healthy steady state).
+// These tests assert each path emits its own distinct comment.
+
+func TestGenerateIPv4Ruleset_FallbackComment_NilPorts(t *testing.T) {
+	ruleset := generateIPv4Ruleset(nil)
+	if !strings.Contains(ruleset, "fallback — configy unreachable") {
+		t.Error("IPv4 nil-ports: expected fallback comment (configy unreachable)")
+	}
+	if strings.Contains(ruleset, "No service ports declared for this host") {
+		t.Error("IPv4 nil-ports: must not emit healthy-zero-ports comment for fallback path")
+	}
+}
+
+func TestGenerateIPv4Ruleset_HealthyZeroPortsComment_EmptySlice(t *testing.T) {
+	ruleset := generateIPv4Ruleset([]PublicPort{})
+	if !strings.Contains(ruleset, "No service ports declared for this host") {
+		t.Error("IPv4 empty-slice: expected healthy-zero-ports comment")
+	}
+	if strings.Contains(ruleset, "configy unreachable") {
+		t.Error("IPv4 empty-slice: must not emit fallback/unreachable comment for healthy zero-ports path")
+	}
+}
+
+func TestGenerateIPv6Ruleset_FallbackComment_NilPorts(t *testing.T) {
+	ruleset := generateIPv6Ruleset(nil)
+	if !strings.Contains(ruleset, "fallback — configy unreachable") {
+		t.Error("IPv6 nil-ports: expected fallback comment (configy unreachable)")
+	}
+	if strings.Contains(ruleset, "No service ports declared for this host") {
+		t.Error("IPv6 nil-ports: must not emit healthy-zero-ports comment for fallback path")
+	}
+}
+
+func TestGenerateIPv6Ruleset_HealthyZeroPortsComment_EmptySlice(t *testing.T) {
+	ruleset := generateIPv6Ruleset([]PublicPort{})
+	if !strings.Contains(ruleset, "No service ports declared for this host") {
+		t.Error("IPv6 empty-slice: expected healthy-zero-ports comment")
+	}
+	if strings.Contains(ruleset, "configy unreachable") {
+		t.Error("IPv6 empty-slice: must not emit fallback/unreachable comment for healthy zero-ports path")
+	}
+}
+
 func TestGenerateIPv4Ruleset_BridgeReturnBeforeDrop_NoPorts(t *testing.T) {
 	assertBridgeReturnBeforeDrop(t, generateIPv4Ruleset(nil), "IPv4 (no ports)")
 }
