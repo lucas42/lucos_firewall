@@ -395,9 +395,13 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirme
 	// Full restore (noflush=false) for the revert so Docker's chains are also restored.
 	log.Println("Preparing owned chains (IPv6)")
 	if err := prepareChains("ip6tables"); err != nil {
-		log.Printf("prepareChains (ip6tables) failed (%v) — reverting IPv4 rules", err)
+		// prepareChains may have partially flushed ip6tables chains — revert both tables.
+		log.Printf("prepareChains (ip6tables) failed (%v) — reverting both tables", err)
 		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
 			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
+		if revertErr := runRestore("ip6tables-restore", savedIPv6, false); revertErr != nil {
+			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
 		}
 		return false, fmt.Errorf("prepareChains (ip6tables): %w", err)
 	}
