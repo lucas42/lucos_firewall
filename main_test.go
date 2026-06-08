@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -206,4 +207,55 @@ func TestFetchEnforceMode_InvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for invalid JSON response")
 	}
+}
+
+// ── generateIPv4Ruleset / generateIPv6Ruleset ruleset tests ──────────────────
+
+// assertBridgeReturnBeforeDrop verifies that the DOCKER-USER chain in the given
+// ruleset contains RETURN rules for br+ and docker0 interfaces, and that both
+// appear before the terminal DROP rule.
+func assertBridgeReturnBeforeDrop(t *testing.T, ruleset, label string) {
+	t.Helper()
+	brPlus := "-A DOCKER-USER -i br+ -j RETURN"
+	docker0 := "-A DOCKER-USER -i docker0 -j RETURN"
+	drop := "-A DOCKER-USER -j DROP"
+
+	brPlusIdx := strings.Index(ruleset, brPlus)
+	docker0Idx := strings.Index(ruleset, docker0)
+	dropIdx := strings.Index(ruleset, drop)
+
+	if brPlusIdx < 0 {
+		t.Errorf("%s: expected %q in DOCKER-USER chain", label, brPlus)
+	}
+	if docker0Idx < 0 {
+		t.Errorf("%s: expected %q in DOCKER-USER chain", label, docker0)
+	}
+	if dropIdx < 0 {
+		t.Errorf("%s: expected %q in DOCKER-USER chain", label, drop)
+		return // ordering checks below require drop to be present
+	}
+	if brPlusIdx >= 0 && brPlusIdx > dropIdx {
+		t.Errorf("%s: %q must appear before %q", label, brPlus, drop)
+	}
+	if docker0Idx >= 0 && docker0Idx > dropIdx {
+		t.Errorf("%s: %q must appear before %q", label, docker0, drop)
+	}
+}
+
+func TestGenerateIPv4Ruleset_BridgeReturnBeforeDrop_NoPorts(t *testing.T) {
+	assertBridgeReturnBeforeDrop(t, generateIPv4Ruleset(nil), "IPv4 (no ports)")
+}
+
+func TestGenerateIPv4Ruleset_BridgeReturnBeforeDrop_WithPorts(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 443}}
+	assertBridgeReturnBeforeDrop(t, generateIPv4Ruleset(ports), "IPv4 (with ports)")
+}
+
+func TestGenerateIPv6Ruleset_BridgeReturnBeforeDrop_NoPorts(t *testing.T) {
+	assertBridgeReturnBeforeDrop(t, generateIPv6Ruleset(nil), "IPv6 (no ports)")
+}
+
+func TestGenerateIPv6Ruleset_BridgeReturnBeforeDrop_WithPorts(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 443}}
+	assertBridgeReturnBeforeDrop(t, generateIPv6Ruleset(ports), "IPv6 (with ports)")
 }

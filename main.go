@@ -519,12 +519,16 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 	sb.WriteString("\n")
 
 	// --- DOCKER-USER chain ---
-	// Mirrors the INPUT allow-list for Docker-published container traffic.
-	// A final DROP blocks any published port not explicitly declared.
+	// Polices externally-originating traffic to Docker-published ports.
+	// Traffic ingressing from Docker bridge interfaces (-i br+ or -i docker0)
+	// hits RETURN and falls back to Docker's own FORWARD/ICC rules, matching
+	// ADR-0007's scope exclusion of intra-stack inter-container traffic.
 	// ESTABLISHED/RELATED is accepted first so in-flight sessions survive
 	// a ruleset re-apply.
-	sb.WriteString("# DOCKER-USER: mirror allow-list for Docker-published port traffic\n")
+	sb.WriteString("# DOCKER-USER: external-origin traffic only — bridge ICC is returned to FORWARD chain\n")
 	sb.WriteString("-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n")
+	sb.WriteString("-A DOCKER-USER -i br+ -j RETURN\n")
+	sb.WriteString("-A DOCKER-USER -i docker0 -j RETURN\n")
 
 	if len(ports) > 0 {
 		for _, p := range ports {
@@ -594,8 +598,16 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 	sb.WriteString("\n")
 
 	// --- DOCKER-USER chain ---
-	sb.WriteString("# DOCKER-USER: mirror allow-list for Docker-published port traffic\n")
+	// Polices externally-originating traffic to Docker-published ports.
+	// Traffic ingressing from Docker bridge interfaces (-i br+ or -i docker0)
+	// hits RETURN and falls back to Docker's own FORWARD/ICC rules, matching
+	// ADR-0007's scope exclusion of intra-stack inter-container traffic.
+	// ESTABLISHED/RELATED is accepted first so in-flight sessions survive
+	// a ruleset re-apply.
+	sb.WriteString("# DOCKER-USER: external-origin traffic only — bridge ICC is returned to FORWARD chain\n")
 	sb.WriteString("-A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n")
+	sb.WriteString("-A DOCKER-USER -i br+ -j RETURN\n")
+	sb.WriteString("-A DOCKER-USER -i docker0 -j RETURN\n")
 
 	if len(ports) > 0 {
 		for _, p := range ports {
