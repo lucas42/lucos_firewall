@@ -373,11 +373,21 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirme
 	// untouched; prepareChains also ensures the FORWARD → DOCKER-USER jump exists.
 	log.Println("Preparing owned chains (IPv4)")
 	if err := prepareChains("iptables"); err != nil {
+		// prepareChains may have partially flushed INPUT or DOCKER-USER before
+		// failing. Revert to restore a clean state.
+		log.Printf("prepareChains (iptables) failed (%v) — reverting IPv4 rules", err)
+		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
+			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
 		return false, fmt.Errorf("prepareChains (iptables): %w", err)
 	}
 	log.Println("Applying IPv4 ruleset via iptables-restore --noflush")
 	if err := runRestore("iptables-restore", ipv4Ruleset, true); err != nil {
-		// Nothing to revert — IPv4 apply failed before any change was committed
+		// prepareChains already flushed INPUT and DOCKER-USER — revert to restore them.
+		log.Printf("iptables-restore failed (%v) — reverting IPv4 rules", err)
+		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
+			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
 		return false, fmt.Errorf("iptables-restore failed: %w", err)
 	}
 
@@ -393,9 +403,13 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirme
 	}
 	log.Println("Applying IPv6 ruleset via ip6tables-restore --noflush")
 	if err := runRestore("ip6tables-restore", ipv6Ruleset, true); err != nil {
-		log.Printf("ip6tables-restore failed (%v) — reverting IPv4 rules", err)
+		// prepareChains("ip6tables") flushed ip6tables INPUT and DOCKER-USER — revert both tables.
+		log.Printf("ip6tables-restore failed (%v) — reverting both tables", err)
 		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
 			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+		}
+		if revertErr := runRestore("ip6tables-restore", savedIPv6, false); revertErr != nil {
+			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
 		}
 		return false, fmt.Errorf("ip6tables-restore failed: %w", err)
 	}
