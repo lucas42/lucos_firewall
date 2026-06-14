@@ -378,3 +378,70 @@ func TestGenerateIPv6Ruleset_BridgeReturnBeforeDrop_WithPorts(t *testing.T) {
 	ports := []PublicPort{{Protocol: "tcp", Port: 443}}
 	assertBridgeReturnBeforeDrop(t, generateIPv6Ruleset(ports), "IPv6 (with ports)")
 }
+
+// ── DOCKER-USER ACCEPT rule format tests (#21) ────────────────────────────────
+//
+// DOCKER-USER ACCEPT rules must use --ctorigdstport (pre-DNAT host port from
+// conntrack) rather than --dport (post-DNAT container port). Using --dport in
+// the FORWARD chain allows any container published as host_port→80/tcp to bypass
+// the allow-list, because Docker's DNAT rewrites dport=host_port to dport=80
+// before FORWARD is evaluated. --ctorigdstport reads the original destination
+// port before any DNAT rewrite, which is the correct value to match against the
+// declared public_ports allow-list. See lucas42/lucos_firewall#21.
+//
+// The INPUT chain is host-destined (not DNAT'd); --dport is correct there and
+// must not be changed.
+
+func assertDOCKERUSERAcceptFormat(t *testing.T, ruleset, protocol string, port int, label string) {
+	t.Helper()
+	wrongRule := fmt.Sprintf("-A DOCKER-USER -p %s --dport %d -j ACCEPT", protocol, port)
+	correctRule := fmt.Sprintf("-A DOCKER-USER -p %s -m conntrack --ctorigdstport %d -j ACCEPT", protocol, port)
+
+	if strings.Contains(ruleset, wrongRule) {
+		t.Errorf("%s: DOCKER-USER ACCEPT must use --ctorigdstport, not --dport (post-DNAT port would bypass the allow-list for port-mapped containers)", label)
+	}
+	if !strings.Contains(ruleset, correctRule) {
+		t.Errorf("%s: expected DOCKER-USER ACCEPT rule %q not found in ruleset", label, correctRule)
+	}
+}
+
+func assertINPUTAcceptUsesdport(t *testing.T, ruleset, protocol string, port int, label string) {
+	t.Helper()
+	inputRule := fmt.Sprintf("-A INPUT -p %s --dport %d -j ACCEPT", protocol, port)
+	if !strings.Contains(ruleset, inputRule) {
+		t.Errorf("%s: INPUT ACCEPT rule should still use --dport (host-destined traffic is not DNAT'd); expected %q", label, inputRule)
+	}
+}
+
+func TestGenerateIPv4Ruleset_DOCKERUSERUsesCtorigdstport(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 80}}
+	assertDOCKERUSERAcceptFormat(t, generateIPv4Ruleset(ports), "tcp", 80, "IPv4")
+}
+
+func TestGenerateIPv4Ruleset_DOCKERUSERUsesCtorigdstport_UDP(t *testing.T) {
+	ports := []PublicPort{{Protocol: "udp", Port: 443}}
+	assertDOCKERUSERAcceptFormat(t, generateIPv4Ruleset(ports), "udp", 443, "IPv4 UDP")
+}
+
+func TestGenerateIPv6Ruleset_DOCKERUSERUsesCtorigdstport(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 80}}
+	assertDOCKERUSERAcceptFormat(t, generateIPv6Ruleset(ports), "tcp", 80, "IPv6")
+}
+
+func TestGenerateIPv6Ruleset_DOCKERUSERUsesCtorigdstport_UDP(t *testing.T) {
+	ports := []PublicPort{{Protocol: "udp", Port: 443}}
+	assertDOCKERUSERAcceptFormat(t, generateIPv6Ruleset(ports), "udp", 443, "IPv6 UDP")
+}
+
+// INPUT must still use --dport (not --ctorigdstport) — host-destined traffic
+// never passes through Docker's DNAT.
+
+func TestGenerateIPv4Ruleset_INPUTStillUsesDport(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 80}}
+	assertINPUTAcceptUsesdport(t, generateIPv4Ruleset(ports), "tcp", 80, "IPv4")
+}
+
+func TestGenerateIPv6Ruleset_INPUTStillUsesDport(t *testing.T) {
+	ports := []PublicPort{{Protocol: "tcp", Port: 80}}
+	assertINPUTAcceptUsesdport(t, generateIPv6Ruleset(ports), "tcp", 80, "IPv6")
+}

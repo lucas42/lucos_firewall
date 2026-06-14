@@ -610,7 +610,15 @@ func generateIPv4Ruleset(ports []PublicPort) string {
 
 	if len(ports) > 0 {
 		for _, p := range ports {
-			sb.WriteString(fmt.Sprintf("-A DOCKER-USER -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
+			// Use --ctorigdstport (conntrack original destination port) rather than
+			// --dport. In the FORWARD chain Docker's DNAT has already rewritten the
+			// destination port (nat PREROUTING runs before filter FORWARD), so --dport
+			// sees the post-DNAT container port, not the host port the client connected
+			// to. --ctorigdstport reads the pre-DNAT original destination stored in the
+			// conntrack entry — the actual host port — which is what should be matched
+			// against the declared public_ports allow-list. The xt_conntrack module is
+			// already in use above (--ctstate ESTABLISHED,RELATED). Fixes #21.
+			sb.WriteString(fmt.Sprintf("-A DOCKER-USER -p %s -m conntrack --ctorigdstport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 	}
 	sb.WriteString("-A DOCKER-USER -j DROP\n")
@@ -695,7 +703,10 @@ func generateIPv6Ruleset(ports []PublicPort) string {
 
 	if len(ports) > 0 {
 		for _, p := range ports {
-			sb.WriteString(fmt.Sprintf("-A DOCKER-USER -p %s --dport %d -j ACCEPT\n", p.Protocol, p.Port))
+			// Same fix as generateIPv4Ruleset: use --ctorigdstport (pre-DNAT host port
+			// from conntrack) instead of --dport (post-DNAT container port). IPv6 DNAT
+			// follows the same nat PREROUTING → filter FORWARD ordering. Fixes #21.
+			sb.WriteString(fmt.Sprintf("-A DOCKER-USER -p %s -m conntrack --ctorigdstport %d -j ACCEPT\n", p.Protocol, p.Port))
 		}
 	}
 	sb.WriteString("-A DOCKER-USER -j DROP\n")
