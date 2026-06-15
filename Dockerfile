@@ -6,7 +6,7 @@ COPY main.go .
 RUN go build -ldflags="-s -w" -o firewall .
 
 # Runtime stage: minimal alpine with iptables/ip6tables available
-FROM alpine:3.23
+FROM alpine:3.24
 ARG VERSION
 ENV VERSION=$VERSION
 
