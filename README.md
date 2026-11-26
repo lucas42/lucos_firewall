@@ -39,7 +39,7 @@ Two mandatory guardrails protect against a bad ruleset locking administrators ou
 
 Host SSH (port 22) is unconditionally accepted in every generated ruleset, independent of the `public_ports` data from configy. The rule is present in:
 - The full ruleset (when configy is reachable)
-- The fallback ruleset (when configy is unreachable)
+- The fallback ruleset (cold start only, before any ruleset has been confirmed)
 - Dry-run log output, where it can be verified before any host is flipped to enforce mode
 
 A host with a broken configy-derived ruleset still has SSH accessible.
@@ -47,12 +47,14 @@ A host with a broken configy-derived ruleset still has SSH accessible.
 ### Guardrail 2 — Timed auto-rollback on enforce (`iptables-apply` pattern)
 
 When applying a new ruleset in enforce mode, the service:
-1. Saves the current iptables/ip6tables state with `iptables-save` / `ip6tables-save`
-2. Applies the new ruleset
+1. Probes configy. If it is already unreachable, nothing is changed (a failure afterwards couldn't be blamed on the new rules) and the apply is retried next poll
+2. Applies the new ruleset to the two chains it owns (`INPUT`, `DOCKER-USER`) via `--noflush` restore
 3. Waits for the confirmation window (`CONFIRM_TIMEOUT_SECONDS`, default 30s)
 4. After the window, verifies connectivity by re-fetching from configy
 5. If configy is **reachable**: rules confirmed and kept
-6. If configy is **not reachable**: previous state is restored via `iptables-restore` and the rules are retried on the next poll
+6. If configy is **not reachable** (having been reachable before the apply): the owned chains are restored to the last confirmed ruleset (or, for the first apply, a `filter`-table snapshot reduced to `INPUT` and `DOCKER-USER`) and the rules are retried on the next poll
+
+A revert never touches the `nat` table or Docker's own chains. If a poll's port fetch fails, the ports from the last *confirmed* apply are held rather than changing the ruleset (ADR-0007 fail-safe contract).
 
 This means a bad ruleset that disrupts network connectivity self-heals within `CONFIRM_TIMEOUT_SECONDS` + one configy round-trip, without manual intervention.
 
