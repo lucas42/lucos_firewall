@@ -33,9 +33,6 @@ const (
 	// heartbeatPath is touched on every successful poll loop iteration.
 	// The Docker healthcheck verifies this file is fresh (< 2 min old).
 	heartbeatPath = "/tmp/lucos-firewall-ok"
-	// degradedPath exists while the firewall is alive but not reconciling
-	// (see degradedTracker). The Docker healthcheck fails while it exists.
-	degradedPath = "/tmp/lucos-firewall-degraded"
 )
 
 // PublicPort represents one entry from the configy /systems/host/{host}/public-ports endpoint.
@@ -158,9 +155,13 @@ func main() {
 		// Touch the heartbeat file so the Docker healthcheck knows the loop
 		// is alive. Written on every iteration regardless of whether rules
 		// changed — the file's modification time is what the check reads.
-		touchHeartbeat()
 		degraded.record(unreachable, reverted)
-		writeDegradedMarker(degradedPath, degraded.reason())
+		if reason := degraded.reason(); reason != "" {
+			// Withhold the heartbeat so the healthcheck goes unhealthy.
+			log.Printf("WARNING: Degraded: %s — not touching heartbeat", reason)
+		} else {
+			touchHeartbeat()
+		}
 
 		time.Sleep(cfg.pollInterval)
 	}
@@ -404,21 +405,6 @@ func (d *degradedTracker) reason() string {
 		return fmt.Sprintf("ruleset reverted after failed confirmation on %d consecutive polls", d.reverts)
 	}
 	return ""
-}
-
-// writeDegradedMarker creates the marker (containing reason) when reason is
-// non-empty and removes it otherwise.
-func writeDegradedMarker(path, reason string) {
-	if reason == "" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			log.Printf("WARNING: Failed to remove degraded marker %s: %v", path, err)
-		}
-		return
-	}
-	log.Printf("WARNING: Degraded: %s", reason)
-	if err := os.WriteFile(path, []byte(reason+"\n"), 0644); err != nil {
-		log.Printf("WARNING: Failed to write degraded marker %s: %v", path, err)
-	}
 }
 
 // appliedState is the last ruleset that was applied and passed confirmation.

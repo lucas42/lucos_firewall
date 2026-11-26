@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -231,20 +230,6 @@ func TestDegradedTracker_UnreachablePollKeepsRevertStreak(t *testing.T) {
 	if !strings.Contains(d.reason(), "reverted") {
 		t.Errorf("revert streak should survive an unreachable poll, got %q", d.reason())
 	}
-}
-
-func TestWriteDegradedMarker_WriteAndRemove(t *testing.T) {
-	path := t.TempDir() + "/degraded"
-	writeDegradedMarker(path, "configy unreachable for 5 consecutive polls")
-	b, err := os.ReadFile(path)
-	if err != nil || !strings.Contains(string(b), "configy unreachable") {
-		t.Fatalf("marker not written with reason: %q %v", b, err)
-	}
-	writeDegradedMarker(path, "")
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("marker should be removed, stat err=%v", err)
-	}
-	writeDegradedMarker(path, "") // removing an absent marker is fine
 }
 
 func TestApply_ErrorClassification(t *testing.T) {

@@ -21,10 +21,8 @@ services:
       # The poll loop touches /tmp/lucos-firewall-ok on every iteration.
       # Unhealthy if the file is missing or older than 2 minutes
       # (covers the default 60s poll + 30s confirm-timeout in enforce mode).
-      # Also unhealthy while /tmp/lucos-firewall-degraded exists (configy
-      # unreachable for 5+ polls, or 3+ consecutive reverts).
       # find + grep are provided by busybox in the Alpine runtime image.
-      test: ["CMD-SHELL", "find /tmp/lucos-firewall-ok -mmin -2 | grep -q . && [ ! -e /tmp/lucos-firewall-degraded ]"]
+      test: ["CMD-SHELL", "find /tmp/lucos-firewall-ok -mmin -2 | grep -q ."]
       interval: 30s
       timeout: 5s
       retries: 3

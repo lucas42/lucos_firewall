@@ -60,7 +60,7 @@ This means a bad ruleset that disrupts network connectivity self-heals within `C
 
 ### Degraded signal
 
-The Docker healthcheck also fails (container `unhealthy`, which lucos_docker_health reports onward) while `/tmp/lucos-firewall-degraded` exists. The poll loop writes it, with a one-line reason, once configy has been unreachable for 5 consecutive polls (failed port fetch or failed pre-apply probe) or the ruleset has been reverted on 3 consecutive polls, and removes it on the first good poll. This is a reporting signal only; nothing restarts the container.
+The poll loop touches the heartbeat file (`/tmp/lucos-firewall-ok`, which the Docker healthcheck reads) every poll, except while degraded: configy unreachable for 5 consecutive polls (failed port fetch or failed pre-apply probe), or the ruleset reverted on 3 consecutive polls. The heartbeat then goes stale, the container turns `unhealthy` and lucos_docker_health reports it onward; the first good poll resumes touching it. The reason is logged each degraded poll. This is a reporting signal only; nothing restarts the container.
 
 ## Environment variables
 
