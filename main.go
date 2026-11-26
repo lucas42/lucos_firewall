@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +33,9 @@ const (
 	// heartbeatPath is touched on every successful poll loop iteration.
 	// The Docker healthcheck verifies this file is fresh (< 2 min old).
 	heartbeatPath = "/tmp/lucos-firewall-ok"
+	// degradedPath exists while the firewall is alive but not reconciling
+	// (see degradedTracker). The Docker healthcheck fails while it exists.
+	degradedPath = "/tmp/lucos-firewall-degraded"
 )
 
 // PublicPort represents one entry from the configy /systems/host/{host}/public-ports endpoint.
@@ -74,6 +78,7 @@ func main() {
 	var lastIPv4Hash, lastIPv6Hash string
 	var lastKnownEnforce *bool  // nil = no successful configy fetch yet (cold start)
 	var confirmed *appliedState // nil until a ruleset has been applied and confirmed
+	var degraded degradedTracker
 
 	for {
 		// Step 1: determine enforce mode from configy (per-host, per-poll).
@@ -100,6 +105,7 @@ func main() {
 
 		// Step 2: fetch public ports from configy.
 		ports, err := fetchPublicPorts(cfg)
+		unreachable, reverted := err != nil, false
 		if err != nil {
 			log.Printf("WARNING: Failed to fetch public ports from configy: %v", err)
 			ports = resolveFailedFetchPorts(confirmed)
@@ -136,6 +142,8 @@ func main() {
 			if applyErr != nil {
 				log.Printf("ERROR applying ruleset: %v", applyErr)
 			}
+			unreachable = unreachable || errors.Is(applyErr, errUnreachableBeforeApply)
+			reverted = errors.Is(applyErr, errReverted)
 			if ok {
 				lastIPv4Hash = ipv4Hash
 				lastIPv6Hash = ipv6Hash
@@ -151,6 +159,8 @@ func main() {
 		// is alive. Written on every iteration regardless of whether rules
 		// changed — the file's modification time is what the check reads.
 		touchHeartbeat()
+		degraded.record(unreachable, reverted)
+		writeDegradedMarker(degradedPath, degraded.reason())
 
 		time.Sleep(cfg.pollInterval)
 	}
@@ -355,6 +365,62 @@ func resolveFailedFetchPorts(confirmed *appliedState) []PublicPort {
 	return confirmed.ports
 }
 
+var (
+	errUnreachableBeforeApply = errors.New("configy unreachable before apply")
+	errReverted               = errors.New("auto-reverted")
+)
+
+const (
+	degradedUnreachablePolls = 5
+	degradedRevertPolls      = 3
+)
+
+// degradedTracker counts consecutive polls where configy was unreachable and
+// consecutive polls ending in a revert; either reaching its threshold is "degraded".
+type degradedTracker struct {
+	unreachable, reverts int
+}
+
+// record updates the counters for one poll. A poll that is neither unreachable
+// nor reverted clears both; an unreachable poll leaves the revert count alone.
+func (d *degradedTracker) record(unreachable, reverted bool) {
+	switch {
+	case unreachable:
+		d.unreachable++
+	case reverted:
+		d.unreachable = 0
+		d.reverts++
+	default:
+		d.unreachable, d.reverts = 0, 0
+	}
+}
+
+// reason returns a one-line description of the degraded condition, or "" if healthy.
+func (d *degradedTracker) reason() string {
+	switch {
+	case d.unreachable >= degradedUnreachablePolls:
+		return fmt.Sprintf("configy unreachable for %d consecutive polls", d.unreachable)
+	case d.reverts >= degradedRevertPolls:
+		return fmt.Sprintf("ruleset reverted after failed confirmation on %d consecutive polls", d.reverts)
+	}
+	return ""
+}
+
+// writeDegradedMarker creates the marker (containing reason) when reason is
+// non-empty and removes it otherwise.
+func writeDegradedMarker(path, reason string) {
+	if reason == "" {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("WARNING: Failed to remove degraded marker %s: %v", path, err)
+		}
+		return
+	}
+	log.Printf("WARNING: Degraded: %s", reason)
+	if err := os.WriteFile(path, []byte(reason+"\n"), 0644); err != nil {
+		log.Printf("WARNING: Failed to write degraded marker %s: %v", path, err)
+	}
+}
+
 // appliedState is the last ruleset that was applied and passed confirmation.
 type appliedState struct {
 	ipv4, ipv6 string
@@ -393,7 +459,7 @@ var defaultOps = iptablesOps{
 // (guardrail 1). applyWithRollback is guardrail 2 — a belt-and-suspenders defence.
 func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, prev *appliedState, cfg appConfig, ops iptablesOps) (confirmed bool, err error) {
 	if probeErr := ops.probe(cfg); probeErr != nil {
-		return false, fmt.Errorf("configy unreachable before apply, leaving rules unchanged: %w", probeErr)
+		return false, fmt.Errorf("%w, leaving rules unchanged: %w", errUnreachableBeforeApply, probeErr)
 	}
 
 	var prevIPv4, prevIPv6 string
@@ -422,11 +488,11 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, prev *appliedState, cfg 
 		log.Printf("Applying %s ruleset to owned chains via %s-restore --noflush", fam.cmd, fam.cmd)
 		if err := ops.prepare(fam.cmd); err != nil {
 			revert()
-			return false, fmt.Errorf("prepareChains (%s): %w", fam.cmd, err)
+			return false, fmt.Errorf("%w: prepareChains (%s): %w", errReverted, fam.cmd, err)
 		}
 		if err := ops.restore(fam.cmd+"-restore", fam.ruleset); err != nil {
 			revert()
-			return false, fmt.Errorf("%s-restore failed: %w", fam.cmd, err)
+			return false, fmt.Errorf("%w: %s-restore failed: %w", errReverted, fam.cmd, err)
 		}
 	}
 
@@ -438,7 +504,7 @@ func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, prev *appliedState, cfg 
 		log.Printf("WARNING: Confirmation failed — configy unreachable after %s: %v", cfg.confirmTimeout, verifyErr)
 		log.Println("Auto-reverting owned chains to previous ruleset (iptables-apply safety pattern)")
 		revert()
-		return false, fmt.Errorf("auto-reverted after %s: configy unreachable", cfg.confirmTimeout)
+		return false, fmt.Errorf("%w after %s: configy unreachable", errReverted, cfg.confirmTimeout)
 	}
 
 	return true, nil

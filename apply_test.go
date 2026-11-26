@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -168,5 +169,93 @@ func TestResolveFailedFetchPorts_HoldsConfirmed_NoRulesetChange(t *testing.T) {
 func TestResolveFailedFetchPorts_ColdStartIsNilFallback(t *testing.T) {
 	if got := resolveFailedFetchPorts(nil); got != nil {
 		t.Errorf("want nil fallback on cold start, got %v", got)
+	}
+}
+
+func TestDegradedTracker_UnreachableThreshold(t *testing.T) {
+	var d degradedTracker
+	for i := 1; i < degradedUnreachablePolls; i++ {
+		d.record(true, false)
+		if d.reason() != "" {
+			t.Fatalf("degraded after only %d unreachable polls", i)
+		}
+	}
+	d.record(true, false)
+	if !strings.Contains(d.reason(), "configy unreachable") {
+		t.Errorf("want unreachable reason at threshold, got %q", d.reason())
+	}
+}
+
+func TestDegradedTracker_RevertThreshold(t *testing.T) {
+	var d degradedTracker
+	for i := 1; i < degradedRevertPolls; i++ {
+		d.record(false, true)
+	}
+	if d.reason() != "" {
+		t.Fatalf("degraded after only %d reverts: %q", degradedRevertPolls-1, d.reason())
+	}
+	d.record(false, true)
+	if !strings.Contains(d.reason(), "reverted") {
+		t.Errorf("want revert reason at threshold, got %q", d.reason())
+	}
+}
+
+func TestDegradedTracker_SingleRevertThenConfirmDoesNotDegrade(t *testing.T) {
+	var d degradedTracker
+	d.record(false, true)
+	d.record(false, false)
+	d.record(false, true)
+	d.record(false, true)
+	if d.reason() != "" {
+		t.Errorf("non-consecutive reverts must not degrade, got %q", d.reason())
+	}
+}
+
+func TestDegradedTracker_ClearsOnFirstGoodPoll(t *testing.T) {
+	var d degradedTracker
+	for i := 0; i < degradedUnreachablePolls; i++ {
+		d.record(true, false)
+	}
+	d.record(false, false)
+	if d.reason() != "" {
+		t.Errorf("want cleared, got %q", d.reason())
+	}
+}
+
+func TestDegradedTracker_UnreachablePollKeepsRevertStreak(t *testing.T) {
+	var d degradedTracker
+	d.record(false, true)
+	d.record(false, true)
+	d.record(true, false)
+	d.record(false, true)
+	if !strings.Contains(d.reason(), "reverted") {
+		t.Errorf("revert streak should survive an unreachable poll, got %q", d.reason())
+	}
+}
+
+func TestWriteDegradedMarker_WriteAndRemove(t *testing.T) {
+	path := t.TempDir() + "/degraded"
+	writeDegradedMarker(path, "configy unreachable for 5 consecutive polls")
+	b, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(b), "configy unreachable") {
+		t.Fatalf("marker not written with reason: %q %v", b, err)
+	}
+	writeDegradedMarker(path, "")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("marker should be removed, stat err=%v", err)
+	}
+	writeDegradedMarker(path, "") // removing an absent marker is fine
+}
+
+func TestApply_ErrorClassification(t *testing.T) {
+	f := &fakeOps{probeErrs: []error{errDown}}
+	_, err := applyWithRollback("a", "b", nil, appConfig{}, f.ops())
+	if !errors.Is(err, errUnreachableBeforeApply) || errors.Is(err, errReverted) {
+		t.Errorf("pre-apply failure misclassified: %v", err)
+	}
+	f = &fakeOps{probeErrs: []error{nil, errDown}}
+	_, err = applyWithRollback("a", "b", nil, appConfig{}, f.ops())
+	if !errors.Is(err, errReverted) || errors.Is(err, errUnreachableBeforeApply) {
+		t.Errorf("post-apply failure misclassified: %v", err)
 	}
 }
