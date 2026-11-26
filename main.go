@@ -30,7 +30,7 @@ const (
 	defaultPollIntervalSeconds   = 60
 	defaultConfirmTimeoutSeconds = 30
 	httpTimeoutSeconds           = 10
-	// heartbeatPath is touched on every successful poll loop iteration.
+	// heartbeatPath is touched on every poll iteration that isn't degraded.
 	// The Docker healthcheck verifies this file is fresh (< 2 min old).
 	heartbeatPath = "/tmp/lucos-firewall-ok"
 )
@@ -152,9 +152,9 @@ func main() {
 			}
 		}
 
-		// Touch the heartbeat file so the Docker healthcheck knows the loop
-		// is alive. Written on every iteration regardless of whether rules
-		// changed — the file's modification time is what the check reads.
+		// Touch the heartbeat so the Docker healthcheck sees a healthy loop,
+		// whether or not rules changed. A stale heartbeat means either a hung
+		// loop or a degraded one (see degradedTracker).
 		degraded.record(unreachable, reverted)
 		if reason := degraded.reason(); reason != "" {
 			// Withhold the heartbeat so the healthcheck goes unhealthy.
