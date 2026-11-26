@@ -72,7 +72,8 @@ func main() {
 	log.Printf("Host: %s, Configy: %s, Poll interval: %s", cfg.hostname, cfg.configyOrigin, cfg.pollInterval)
 
 	var lastIPv4Hash, lastIPv6Hash string
-	var lastKnownEnforce *bool // nil = no successful configy fetch yet (cold start)
+	var lastKnownEnforce *bool  // nil = no successful configy fetch yet (cold start)
+	var confirmed *appliedState // nil until a ruleset has been applied and confirmed
 
 	for {
 		// Step 1: determine enforce mode from configy (per-host, per-poll).
@@ -101,9 +102,7 @@ func main() {
 		ports, err := fetchPublicPorts(cfg)
 		if err != nil {
 			log.Printf("WARNING: Failed to fetch public ports from configy: %v", err)
-			log.Println("Applying fallback ruleset (base rules only — SSH, ICMP, loopback, connection tracking; no service ports)")
-			// nil ports → base ruleset only (fails closed on service ports)
-			ports = nil
+			ports = resolveFailedFetchPorts(confirmed)
 		} else {
 			log.Printf("Fetched %d public port(s) from configy for host %s", len(ports), cfg.hostname)
 			// Validate and filter ports before passing to the ruleset generator.
@@ -132,17 +131,18 @@ func main() {
 			logRuleset(ipv4Ruleset, "iptables-restore")
 			logRuleset(ipv6Ruleset, "ip6tables-restore")
 		} else {
-			// Enforce mode: save → apply → confirm → revert-if-needed
-			confirmed, applyErr := applyWithRollback(ipv4Ruleset, ipv6Ruleset, cfg)
+			// Enforce mode: probe → apply → confirm → revert-if-needed
+			ok, applyErr := applyWithRollback(ipv4Ruleset, ipv6Ruleset, confirmed, cfg, defaultOps)
 			if applyErr != nil {
 				log.Printf("ERROR applying ruleset: %v", applyErr)
 			}
-			if confirmed {
+			if ok {
 				lastIPv4Hash = ipv4Hash
 				lastIPv6Hash = ipv6Hash
+				confirmed = &appliedState{ipv4: ipv4Ruleset, ipv6: ipv6Ruleset, ports: ports, at: time.Now()}
 				log.Println("Rules confirmed and active")
 			} else {
-				// Rolled back or apply failed — don't update hashes so we retry next poll
+				// Skipped, rolled back or apply failed — don't update hashes so we retry next poll
 				log.Println("Rules NOT confirmed — will retry on next poll")
 			}
 		}
@@ -343,107 +343,145 @@ func filterValidPorts(ports []PublicPort) []PublicPort {
 	return valid
 }
 
-// applyWithRollback implements the iptables-apply safety pattern:
-//  1. Save the current iptables/ip6tables state.
-//  2. Apply the new rulesets.
-//  3. Wait for the confirmation window (cfg.confirmTimeout).
-//  4. Re-check configy to confirm the host still has network connectivity.
-//  5. If the check fails, revert to the saved state and return (false, err).
-//  6. If the check succeeds, return (true, nil).
+// resolveFailedFetchPorts returns the ports to use when the configy fetch failed:
+// the last confirmed list (ADR-0007 fail-safe contract), or nil (base-only
+// fallback) when nothing has been confirmed yet.
+func resolveFailedFetchPorts(confirmed *appliedState) []PublicPort {
+	if confirmed == nil {
+		log.Println("No confirmed ruleset yet — using fallback ruleset (base rules only — SSH, ICMP, loopback, connection tracking; no service ports)")
+		return nil
+	}
+	log.Printf("WARNING: Holding last confirmed ports (%d port(s), confirmed %s ago)", len(confirmed.ports), time.Since(confirmed.at).Round(time.Second))
+	return confirmed.ports
+}
+
+// appliedState is the last ruleset that was applied and passed confirmation.
+type appliedState struct {
+	ipv4, ipv6 string
+	ports      []PublicPort
+	at         time.Time
+}
+
+// iptablesOps lets tests observe every command applyWithRollback issues.
+type iptablesOps struct {
+	save    func(command string, args ...string) (string, error)
+	restore func(command, ruleset string) error
+	prepare func(iptablesCmd string) error
+	probe   func(cfg appConfig) error
+	sleep   func(time.Duration)
+}
+
+var defaultOps = iptablesOps{
+	save:    saveRules,
+	restore: runRestore,
+	prepare: prepareChains,
+	probe:   func(cfg appConfig) error { _, err := fetchPublicPorts(cfg); return err },
+	sleep:   time.Sleep,
+}
+
+// applyWithRollback implements the iptables-apply safety pattern, differentially:
+//  1. Probe configy. If it is already unreachable, change nothing — a later
+//     failure could not be attributed to the new rules.
+//  2. Apply the new rulesets to the owned chains (INPUT, DOCKER-USER) only.
+//  3. Wait for the confirmation window, then probe configy again.
+//  4. If that probe fails, restore the owned chains from the last confirmed
+//     ruleset (or, on first apply, from a filter-table snapshot) and return false.
 //
-// This ensures a bad ruleset self-heals without manual intervention. If a new
-// ruleset were to drop connectivity (e.g., a bug removing the ESTABLISHED/RELATED
-// rule), the configy check would fail and the previous known-good rules are restored.
+// Nothing here ever restores a table or chain the firewall doesn't own.
 //
 // NOTE: SSH port 22 is unconditionally hardcoded in every generated ruleset
 // (guardrail 1). applyWithRollback is guardrail 2 — a belt-and-suspenders defence.
-func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, cfg appConfig) (confirmed bool, err error) {
-	// Step 1: save current state
-	savedIPv4, err := saveRules("iptables-save")
-	if err != nil {
-		return false, fmt.Errorf("saving IPv4 rules before apply: %w", err)
-	}
-	savedIPv6, err := saveRules("ip6tables-save")
-	if err != nil {
-		return false, fmt.Errorf("saving IPv6 rules before apply: %w", err)
+func applyWithRollback(ipv4Ruleset, ipv6Ruleset string, prev *appliedState, cfg appConfig, ops iptablesOps) (confirmed bool, err error) {
+	if probeErr := ops.probe(cfg); probeErr != nil {
+		return false, fmt.Errorf("configy unreachable before apply, leaving rules unchanged: %w", probeErr)
 	}
 
-	// Step 2: flush owned chains, then apply new IPv4 rules via --noflush restore.
-	// Docker-managed chains (FORWARD, DOCKER-FORWARD, DOCKER-ISOLATION-*) are
-	// untouched; prepareChains also ensures the FORWARD → DOCKER-USER jump exists.
-	log.Println("Preparing owned chains (IPv4)")
-	if err := prepareChains("iptables"); err != nil {
-		// prepareChains may have partially flushed INPUT or DOCKER-USER before
-		// failing. Revert to restore a clean state.
-		log.Printf("prepareChains (iptables) failed (%v) — reverting IPv4 rules", err)
-		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+	var prevIPv4, prevIPv6 string
+	if prev != nil {
+		prevIPv4, prevIPv6 = prev.ipv4, prev.ipv6
+	} else {
+		snapIPv4, err := ops.save("iptables-save", "-t", "filter")
+		if err != nil {
+			return false, fmt.Errorf("saving IPv4 rules before apply: %w", err)
 		}
-		return false, fmt.Errorf("prepareChains (iptables): %w", err)
+		snapIPv6, err := ops.save("ip6tables-save", "-t", "filter")
+		if err != nil {
+			return false, fmt.Errorf("saving IPv6 rules before apply: %w", err)
+		}
+		prevIPv4, prevIPv6 = ownedChainsSnapshot(snapIPv4), ownedChainsSnapshot(snapIPv6)
 	}
-	log.Println("Applying IPv4 ruleset via iptables-restore --noflush")
-	if err := runRestore("iptables-restore", ipv4Ruleset, true); err != nil {
-		// prepareChains already flushed INPUT and DOCKER-USER — revert to restore them.
-		log.Printf("iptables-restore failed (%v) — reverting IPv4 rules", err)
-		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
-		}
-		return false, fmt.Errorf("iptables-restore failed: %w", err)
+	revert := func() {
+		revertOwnedChains("iptables", prevIPv4, ops)
+		revertOwnedChains("ip6tables", prevIPv6, ops)
 	}
 
-	// Step 2b: apply new IPv6 rules — revert IPv4 if this fails.
-	// Full restore (noflush=false) for the revert so Docker's chains are also restored.
-	log.Println("Preparing owned chains (IPv6)")
-	if err := prepareChains("ip6tables"); err != nil {
-		// prepareChains may have partially flushed ip6tables chains — revert both tables.
-		log.Printf("prepareChains (ip6tables) failed (%v) — reverting both tables", err)
-		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
+	for _, fam := range []struct{ cmd, ruleset string }{
+		{"iptables", ipv4Ruleset},
+		{"ip6tables", ipv6Ruleset},
+	} {
+		log.Printf("Applying %s ruleset to owned chains via %s-restore --noflush", fam.cmd, fam.cmd)
+		if err := ops.prepare(fam.cmd); err != nil {
+			revert()
+			return false, fmt.Errorf("prepareChains (%s): %w", fam.cmd, err)
 		}
-		if revertErr := runRestore("ip6tables-restore", savedIPv6, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
+		if err := ops.restore(fam.cmd+"-restore", fam.ruleset); err != nil {
+			revert()
+			return false, fmt.Errorf("%s-restore failed: %w", fam.cmd, err)
 		}
-		return false, fmt.Errorf("prepareChains (ip6tables): %w", err)
-	}
-	log.Println("Applying IPv6 ruleset via ip6tables-restore --noflush")
-	if err := runRestore("ip6tables-restore", ipv6Ruleset, true); err != nil {
-		// prepareChains("ip6tables") flushed ip6tables INPUT and DOCKER-USER — revert both tables.
-		log.Printf("ip6tables-restore failed (%v) — reverting both tables", err)
-		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
-		}
-		if revertErr := runRestore("ip6tables-restore", savedIPv6, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
-		}
-		return false, fmt.Errorf("ip6tables-restore failed: %w", err)
 	}
 
-	// Step 3: confirmation window — wait before verifying
 	log.Printf("Rules applied — waiting %s for confirmation window", cfg.confirmTimeout)
-	time.Sleep(cfg.confirmTimeout)
+	ops.sleep(cfg.confirmTimeout)
 
-	// Step 4: verify configy is reachable (proves outbound connectivity is intact)
 	log.Println("Confirmation window elapsed — verifying configy reachability")
-	if _, verifyErr := fetchPublicPorts(cfg); verifyErr != nil {
+	if verifyErr := ops.probe(cfg); verifyErr != nil {
 		log.Printf("WARNING: Confirmation failed — configy unreachable after %s: %v", cfg.confirmTimeout, verifyErr)
-		log.Println("Auto-reverting to previous ruleset (iptables-apply safety pattern)")
-
-		if revertErr := runRestore("iptables-restore", savedIPv4, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv4 rules: %v", revertErr)
-		}
-		if revertErr := runRestore("ip6tables-restore", savedIPv6, false); revertErr != nil {
-			log.Printf("ERROR reverting IPv6 rules: %v", revertErr)
-		}
+		log.Println("Auto-reverting owned chains to previous ruleset (iptables-apply safety pattern)")
+		revert()
 		return false, fmt.Errorf("auto-reverted after %s: configy unreachable", cfg.confirmTimeout)
 	}
 
 	return true, nil
 }
 
+// revertOwnedChains re-applies a previous INPUT/DOCKER-USER ruleset through the
+// same prepare + --noflush path as a normal apply.
+func revertOwnedChains(iptablesCmd, ruleset string, ops iptablesOps) {
+	if err := ops.prepare(iptablesCmd); err != nil {
+		log.Printf("ERROR preparing %s chains for revert: %v", iptablesCmd, err)
+		return
+	}
+	if err := ops.restore(iptablesCmd+"-restore", ruleset); err != nil {
+		log.Printf("ERROR reverting %s rules: %v", iptablesCmd, err)
+	}
+}
+
+// ownedChainsSnapshot reduces `iptables-save -t filter` output to a ruleset
+// declaring only INPUT and DOCKER-USER, so restoring it can't touch Docker's chains.
+func ownedChainsSnapshot(save string) string {
+	policy := "ACCEPT"
+	var rules []string
+	for _, line := range strings.Split(save, "\n") {
+		switch {
+		case strings.HasPrefix(line, ":INPUT "):
+			if f := strings.Fields(line); len(f) >= 2 {
+				policy = f[1]
+			}
+		case strings.HasPrefix(line, "-A INPUT "), strings.HasPrefix(line, "-A DOCKER-USER "):
+			rules = append(rules, line)
+		}
+	}
+	out := "*filter\n:INPUT " + policy + " [0:0]\n:DOCKER-USER - [0:0]\n"
+	for _, r := range rules {
+		out += r + "\n"
+	}
+	return out + "COMMIT\n"
+}
+
 // saveRules runs iptables-save or ip6tables-save and returns the output.
-func saveRules(command string) (string, error) {
+func saveRules(command string, args ...string) (string, error) {
 	var out bytes.Buffer
-	cmd := exec.Command(command)
+	cmd := exec.Command(command, args...)
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -452,17 +490,10 @@ func saveRules(command string) (string, error) {
 	return out.String(), nil
 }
 
-// runRestore pipes the given ruleset into iptables-restore or ip6tables-restore.
-// When noflush is true the --noflush flag is passed so only the chains declared
-// in the ruleset are touched; Docker-managed chains (FORWARD, DOCKER-FORWARD,
-// DOCKER-ISOLATION-*) are left intact. When noflush is false (rollback path)
-// the full table is replaced, restoring Docker's chains from the saved snapshot.
-func runRestore(command, ruleset string, noflush bool) error {
-	args := []string{}
-	if noflush {
-		args = []string{"--noflush"}
-	}
-	cmd := exec.Command(command, args...)
+// runRestore pipes the ruleset into iptables-restore or ip6tables-restore with
+// --noflush, so only the chains the ruleset declares are touched.
+func runRestore(command, ruleset string) error {
+	cmd := exec.Command(command, "--noflush")
 	cmd.Stdin = strings.NewReader(ruleset)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
