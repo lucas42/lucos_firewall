@@ -58,6 +58,10 @@ A revert never touches the `nat` table or Docker's own chains. If a poll's port 
 
 This means a bad ruleset that disrupts network connectivity self-heals within `CONFIRM_TIMEOUT_SECONDS` + one configy round-trip, without manual intervention.
 
+### Degraded signal
+
+The poll loop touches the heartbeat file (`/tmp/lucos-firewall-ok`, which the Docker healthcheck reads) every poll, except while degraded: configy unreachable for 5 consecutive polls (failed port fetch or failed pre-apply probe), or the ruleset reverted on 3 consecutive polls. The heartbeat then goes stale, the container turns `unhealthy` and lucos_docker_health reports it onward; the first good poll resumes touching it. The reason is logged each degraded poll. This is a reporting signal only; nothing restarts the container.
+
 ## Environment variables
 
 | Variable | Required | Default | Description |
